@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import agent.display as display_module
 from agent.display import (
     build_tool_preview,
+    build_rich_tool_preview,
     capture_local_edit_snapshot,
     extract_edit_diff,
     get_cute_tool_message,
@@ -493,7 +494,6 @@ class TestBuildToolLabel:
             label = build_tool_label(tool_name, {"query": "x", "path": "x", "url": "x"})
             assert label, f"{tool_name} produced empty label"
 
-
 class TestBuildStatusPhrase:
     """build_status_phrase — live working-state text for Slack's status line."""
 
@@ -551,3 +551,78 @@ class TestBuildStatusPhrase:
         from agent.display import build_status_phrase
         phrase = build_status_phrase("skills_list", {"category": "devops"})
         assert phrase == "is listing skills…"
+
+
+class TestBuildRichToolPreview:
+    """Rich tool-progress emitter: header + fenced, capped, fence-safe body.
+
+    Replaces the raw json.dumps(args) verbose dump that rendered escaped \\n
+    blobs in Discord (Adam, 2026-06).
+    """
+
+    @staticmethod
+    def _balanced(s: str) -> bool:
+        return s is not None and s.count("```") % 2 == 0
+
+    def test_execute_code_python_fence(self):
+        out = build_rich_tool_preview(
+            "execute_code", {"code": "x = 1\nprint(x)"}, emoji="🐍",
+        )
+        assert out is not None
+        assert out.startswith("🐍 execute_code\n```python\n")
+        assert out.endswith("```")
+        assert self._balanced(out)
+
+    def test_patch_diff_fence(self):
+        out = build_rich_tool_preview(
+            "patch",
+            {"path": "a/b/SKILL.md", "old_string": "old line", "new_string": "new line"},
+            emoji="🔧",
+        )
+        assert "🔧 patch · b/SKILL.md" in out
+        assert "```diff" in out
+        assert "- old line" in out
+        assert "+ new line" in out
+        assert self._balanced(out)
+
+    def test_read_file_is_oneliner_with_range(self):
+        out = build_rich_tool_preview(
+            "read_file", {"path": "x/y/display.py", "offset": 100, "limit": 130},
+            emoji="📖",
+        )
+        assert out is not None
+        assert out == "📖 read_file · y/display.py:100–229"
+        assert "```" not in out
+
+    def test_write_file_uses_extension_language(self):
+        out = build_rich_tool_preview(
+            "write_file", {"path": "foo/bar.py", "content": "a = 1\n"}, emoji="📝",
+        )
+        assert "```python" in out
+        assert self._balanced(out)
+
+    def test_unhandled_tool_returns_none(self):
+        # todo/search_files/etc. fall back to the compact one-liner builder.
+        assert build_rich_tool_preview("todo", {"todos": [{"id": "1"}]}) is None
+        assert build_rich_tool_preview("search_files", {"pattern": "x"}) is None
+
+    def test_empty_or_missing_args_return_none(self):
+        assert build_rich_tool_preview("execute_code", {}) is None
+        assert build_rich_tool_preview("execute_code", {"code": "  "}) is None
+        assert build_rich_tool_preview("patch", {"path": "x"}) is None
+
+    def test_inner_triple_backtick_is_neutralized(self):
+        # A code body containing literal ``` must not break the outer fence.
+        out = build_rich_tool_preview(
+            "execute_code", {"code": "s = '''\n```\nhi\n```\n'''"}, emoji="🐍",
+        )
+        assert self._balanced(out)
+        assert "```\nhi" not in out  # raw inner fence neutralized
+        assert "\u200b" in out       # zero-width space injected
+
+    def test_long_body_capped_with_hidden_count(self):
+        code = "\n".join(f"line_{i} = {i}" for i in range(30))
+        out = build_rich_tool_preview("execute_code", {"code": code}, max_lines=12)
+        assert self._balanced(out)
+        assert "+18 more lines" in out
+        assert out.count("line_") == 12  # only first 12 body lines shown

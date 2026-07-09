@@ -1490,7 +1490,69 @@ class CodeBlockProgressAdapter(ProgressCaptureAdapter):
     supports_code_blocks = True
 
 
+class RichExecuteCodeThenPlainAgent:
+    """Emits a fenced rich tool preview followed by a plain tool card."""
+
+    CODE = "from pathlib import Path\nprint(Path.cwd())"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "execute_code", None, {"code": self.CODE})
+        time.sleep(0.45)
+        cb("tool.started", "search_files", None, {"pattern": "foo", "path": "."})
+        time.sleep(0.45)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+@pytest.mark.asyncio
+async def test_discord_fenced_progress_previews_are_atomic_bubbles(monkeypatch, tmp_path):
+    """Discord must not append later tool cards into fenced rich previews.
+
+    The rich execute_code preview is valid Markdown by itself, but Discord can
+    show raw ```python fences when the gateway edits that same bubble to append
+    another tool card.  Keep fenced Discord previews as atomic progress bubbles.
+    """
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RichExecuteCodeThenPlainAgent,
+        session_id="sess-discord-atomic-rich-progress",
+        config_data={
+            "display": {
+                "platforms": {
+                    "discord": {
+                        "tool_progress": "verbose",
+                        "tool_progress_grouping": "accumulate",
+                    }
+                }
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="dm-atomic",
+        chat_type="dm",
+        thread_id="",
+        adapter_cls=CodeBlockProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    contents = [call["content"] for call in adapter.sent] + [
+        call["content"] for call in adapter.edits
+    ]
+    assert any("execute_code\n```python" in content for content in contents)
+    assert any("search_files" in content for content in contents)
+    assert not any(
+        "execute_code\n```python" in content and "search_files" in content
+        for content in contents
+    )
+
+
 class TerminalCommandAgent:
+
     """Emits a terminal tool.started with a real, multi-line command arg."""
 
     CMD = (

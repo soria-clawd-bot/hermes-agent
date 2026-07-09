@@ -2872,6 +2872,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             message_ids = []
             reference = None
+            _suppress_embeds = self._discord_suppress_link_embeds()
 
             if reply_to and self._reply_to_mode != "off":
                 try:
@@ -2892,6 +2893,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     msg = await channel.send(
                         content=chunk,
                         reference=chunk_reference,
+                        suppress_embeds=_suppress_embeds,
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -2914,6 +2916,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
+                            suppress_embeds=_suppress_embeds,
                         )
                     else:
                         raise
@@ -4858,14 +4861,222 @@ class DiscordAdapter(BasePlatformAdapter):
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
 
     def format_message(self, content: str) -> str:
-        """Format message for Discord.
+        """Format outbound text for Discord.
 
-        Converts GFM markdown tables to bullet-list groups since Discord
-        does not render pipe tables natively.
+        Discord has no native table rendering and has a stricter heading rule
+        than GitHub-flavored Markdown: heading/subtext lines only render as
+        such when preceded by a blank line. We therefore convert GFM tables to
+        aligned monospace blocks and insert missing heading spacing. Both
+        transforms are code-fence aware, so code/diff blocks are not rewritten.
         """
-        if not content:
+        if not content or "\n" not in content:
             return content
-        return convert_table_to_bullets(content)
+        if self._discord_render_tables():
+            content = self._render_markdown_tables(content)
+        return self._fix_discord_headings(content)
+
+    def _discord_render_tables(self) -> bool:
+        """Whether GFM tables are converted to aligned monospace code blocks."""
+        configured = self.config.extra.get("render_tables")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off", ""}
+            return bool(configured)
+        return os.getenv("DISCORD_RENDER_TABLES", "true").lower() not in {"false", "0", "no", "off"}
+
+    @staticmethod
+    def _strip_inline_md(cell: str) -> str:
+        """Reduce a table cell's inline Markdown to its visible text.
+
+        The converted table lives inside a code block, where Markdown markers
+        would render as literal noise. Flatten the common inline forms while
+        preserving identifiers like ``read_file`` / ``sites_default_files``.
+        """
+        s = cell.strip()
+        s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)
+        s = re.sub(r"\*\*\*([^*]+)\*\*\*", r"\1", s)
+        s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+        s = re.sub(r"\*([^*]+)\*", r"\1", s)
+        s = re.sub(r"~~([^~]+)~~", r"\1", s)
+        s = re.sub(r"__([^_]+)__", r"\1", s)
+        s = re.sub(r"(?<![A-Za-z0-9_])_([^_]+)_(?![A-Za-z0-9_])", r"\1", s)
+        s = s.replace("`", "")
+        s = s.replace("\\|", "|")
+        return s.strip()
+
+    @classmethod
+    def _split_table_row(cls, line: str) -> Optional[List[str]]:
+        """Split a pipe row into cells, honoring escaped pipes."""
+        s = line.strip()
+        if "|" not in s:
+            return None
+        parts = re.split(r"(?<!\\)\|", s)
+        if parts and parts[0].strip() == "":
+            parts = parts[1:]
+        if parts and parts[-1].strip() == "":
+            parts = parts[:-1]
+        return parts if parts else None
+
+    @staticmethod
+    def _is_table_separator(cells: Optional[List[str]]) -> bool:
+        """True when every cell matches the GFM separator form."""
+        if not cells:
+            return False
+        return all(re.fullmatch(r"\s*:?-+:?\s*", c) is not None for c in cells)
+
+    @staticmethod
+    def _cell_alignments(sep_cells: List[str]) -> List[str]:
+        """Map separator cells to left/right/center alignment."""
+        aligns = []
+        for c in sep_cells:
+            c = c.strip()
+            left = c.startswith(":")
+            right = c.endswith(":")
+            if left and right:
+                aligns.append("center")
+            elif right:
+                aligns.append("right")
+            else:
+                aligns.append("left")
+        return aligns
+
+    @classmethod
+    def _render_markdown_tables(cls, content: str) -> str:
+        """Convert GFM pipe tables to aligned monospace code blocks.
+
+        Detection: a row whose next line is a separator row (``|---|---|``).
+        Width is measured with display width (wcwidth) so emoji / CJK cells
+        align correctly. Tables already inside fenced code blocks are left
+        untouched.
+        """
+        try:
+            from wcwidth import wcswidth as _disp
+        except Exception:  # pragma: no cover - wcwidth ships with discord.py
+            _disp = lambda s: len(s)
+
+        def width(s: str) -> int:
+            w = _disp(s)
+            return w if w >= 0 else len(s)
+
+        def pad(s: str, target: int, align: str) -> str:
+            gap = target - width(s)
+            if gap <= 0:
+                return s
+            if align == "right":
+                return " " * gap + s
+            if align == "center":
+                left = gap // 2
+                return " " * left + s + " " * (gap - left)
+            return s + " " * gap
+
+        lines = content.split("\n")
+        out: List[str] = []
+        in_fence = False
+        i = 0
+        n = len(lines)
+        while i < n:
+            line = lines[i]
+            stripped = line.lstrip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                out.append(line)
+                i += 1
+                continue
+
+            header_cells = None if in_fence else cls._split_table_row(line)
+            sep_cells = (
+                cls._split_table_row(lines[i + 1])
+                if (header_cells and i + 1 < n)
+                else None
+            )
+
+            if (
+                header_cells
+                and sep_cells
+                and cls._is_table_separator(sep_cells)
+                and len(sep_cells) >= 1
+            ):
+                aligns = cls._cell_alignments(sep_cells)
+                ncols = len(header_cells)
+                rows = [[cls._strip_inline_md(c) for c in header_cells]]
+                j = i + 2
+                while j < n:
+                    body = cls._split_table_row(lines[j])
+                    if not body or lines[j].lstrip().startswith("```"):
+                        break
+                    rows.append([cls._strip_inline_md(c) for c in body])
+                    j += 1
+
+                while len(aligns) < ncols:
+                    aligns.append("left")
+                norm = []
+                for r in rows:
+                    r = (r + [""] * ncols)[:ncols]
+                    norm.append(r)
+
+                col_w = [0] * ncols
+                for r in norm:
+                    for k in range(ncols):
+                        col_w[k] = max(col_w[k], width(r[k]))
+
+                def fmt_row(r):
+                    return (
+                        "| "
+                        + " | ".join(pad(r[k], col_w[k], aligns[k]) for k in range(ncols))
+                        + " |"
+                    )
+
+                def sep_row():
+                    segs = []
+                    for k in range(ncols):
+                        dashes = "-" * col_w[k]
+                        a = aligns[k]
+                        if a == "center":
+                            segs.append(":" + "-" * max(1, col_w[k] - 2) + ":") if col_w[k] >= 2 else segs.append(":-:")
+                        elif a == "right":
+                            segs.append("-" * max(1, col_w[k] - 1) + ":")
+                        else:
+                            segs.append(dashes)
+                    return "| " + " | ".join(segs) + " |"
+
+                block = ["```", fmt_row(norm[0]), sep_row()]
+                for r in norm[1:]:
+                    block.append(fmt_row(r))
+                block.append("```")
+                out.extend(block)
+                i = j
+                continue
+
+            out.append(line)
+            i += 1
+        return "\n".join(out)
+
+    @staticmethod
+    def _fix_discord_headings(content: str) -> str:
+        """Ensure a blank line precedes Discord heading/subtext lines.
+
+        Code-fence aware: lines inside triple-backtick blocks are emitted
+        verbatim. A heading is ``#``, ``##``, ``###`` or ``-#`` followed by a
+        space at the start of a line.
+        """
+        heading_re = re.compile(r"^(#{1,3}|-#) ")
+        out: List[str] = []
+        in_fence = False
+        for line in content.split("\n"):
+            stripped = line.lstrip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                out.append(line)
+                continue
+            if (
+                not in_fence
+                and heading_re.match(line)
+                and out
+                and out[-1].strip() != ""
+            ):
+                out.append("")
+            out.append(line)
+        return "\n".join(out)
 
     async def _run_simple_slash(
         self,
@@ -5641,6 +5852,23 @@ class DiscordAdapter(BasePlatformAdapter):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
+
+    def _discord_suppress_link_embeds(self) -> bool:
+        """Return whether to suppress auto link-preview embed cards on text sends.
+
+        Discord renders a preview card for every bare URL / markdown link, which
+        pushes real content off-screen.  Passing ``suppress_embeds=True`` to
+        ``channel.send()`` drops those auto-preview cards (explicit rich embeds
+        and media sends are unaffected).  Default ON; override with
+        ``discord.suppress_link_embeds`` in config.yaml or
+        ``DISCORD_SUPPRESS_LINK_EMBEDS`` in the env.
+        """
+        configured = self.config.extra.get("suppress_link_embeds")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off", ""}
+            return bool(configured)
+        return os.getenv("DISCORD_SUPPRESS_LINK_EMBEDS", "true").lower() not in {"false", "0", "no", "off"}
 
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.

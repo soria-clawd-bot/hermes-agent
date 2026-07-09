@@ -107,6 +107,31 @@ def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
 
 
+_CHAT_COMPACTION_TECHNICAL_STATUS_RE = re.compile(
+    r"("  # compression diagnostics that belong in logs, not chat threads
+    r"codex\s+gpt-5\.5\s+caps\s+context"
+    r"|opt\s+back\s+out:\s*hermes\s+config\s+set\s+compression\."
+    r"|preflight\s+compression"
+    r"|compression\s+summary\s+failed"
+    r"|fallback\s+context\s+marker"
+    r"|configured\s+compression\s+model\s+.+\s+failed"
+    r"|compression\s+model\s+.+\s+context\s+is\s+[\d,]+\s+tokens"
+    r"|auto-lowered\s+this\s+session['’]s\s+threshold"
+    r"|to\s+make\s+this\s+permanent,\s+edit\s+config\.yaml"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_CHAT_COMPACTION_QUIET_PLATFORMS = frozenset({
+    "discord",
+    "slack",
+    "whatsapp",
+    "whatsapp_cloud",
+    "signal",
+    "sms",
+    "email",
+})
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"
@@ -477,7 +502,13 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _gateway_surface_passes_raw_text(platform):
         return text
 
+    platform_key = _gateway_platform_value(platform)
     text = _redact_gateway_user_facing_secrets(text)
+    if (
+        platform_key in _CHAT_COMPACTION_QUIET_PLATFORMS
+        and _CHAT_COMPACTION_TECHNICAL_STATUS_RE.search(text)
+    ):
+        return None
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         return None
     if _looks_like_gateway_provider_error(text):
@@ -522,6 +553,71 @@ def _resolve_progress_thread_id(platform: Any, source_thread_id: Any, event_mess
     if platform_key in {"slack", "mattermost"} and event_message_id:
         return str(event_message_id)
     return None
+
+
+def _progress_message_requires_atomic_bubble(platform: Any, message: Any) -> bool:
+    """Return True when a progress preview must not be grouped into an edit.
+
+    Discord can lose Markdown state when an existing progress bubble is edited
+    from one fenced code-preview to a larger blob that appends later tool cards
+    after the fence.  Treat fenced Discord tool previews as atomic bubbles so a
+    later edit never injects another tool block into the same Markdown parse.
+    """
+    platform_value = getattr(platform, "value", platform)
+    platform_key = str(platform_value or "").lower()
+    return platform_key == "discord" and isinstance(message, str) and "```" in message
+
+
+def _format_discord_reasoning_progress_message(
+    reasoning: Any,
+    *,
+    max_lines: int = 15,
+    max_chars: int = 1800,
+) -> str:
+    """Render live reasoning as Discord subtext for an editable progress bubble."""
+    text = str(reasoning or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text)
+    except Exception:
+        pass
+
+    clean_lines: List[str] = []
+    skipped_fragments = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("-#"):
+            # Defensive: avoid echoing Discord's subtext marker back into the
+            # rendered body if the stream already contained a partial marker.
+            line = line[2:].strip()
+        # Discord renders a bare "-#" blank subtext line visibly, and streaming
+        # deltas can briefly contain markdown/table fragments. Drop those rather
+        # than leaving ugly artifacts in the editable reasoning bubble.
+        if not line or line in {"|", "-", "*", ">", "#", "```"}:
+            skipped_fragments += 1
+            continue
+        clean_lines.append(" ".join(line.split()))
+
+    if not clean_lines:
+        return ""
+
+    omitted_fragments = skipped_fragments
+    if max_lines > 0 and len(clean_lines) > max_lines:
+        omitted_fragments += len(clean_lines) - max_lines
+        clean_lines = clean_lines[-max_lines:]
+    display = "\n".join(clean_lines).strip()
+    if max_chars > 0 and len(display) > max_chars:
+        display = "…" + display[-(max_chars - 1):]
+
+    header = "-# 💭 Reasoning"
+    if omitted_fragments:
+        header += f" · latest {len(display.splitlines())} lines"
+    rendered = [header]
+    rendered.extend(f"-# {line}" for line in display.splitlines())
+    return "\n".join(rendered)
 
 
 def _has_platform_display_override(user_config: dict, platform_key: str, setting: str) -> bool:
@@ -16876,17 +16972,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return None
         try:
-            metadata = {}
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                metadata["gateway_session_id"] = parent_session_id
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
-                metadata=metadata,
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -19073,7 +19164,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         _thinking_enabled = _thinking_mode != "off"
-        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+        try:
+            _reasoning_progress_enabled = (
+                source.platform == Platform.DISCORD
+                and _resolve_gateway_display_bool(
+                    user_config,
+                    platform_key,
+                    "show_reasoning",
+                    default=bool(getattr(self, "_show_reasoning", False)),
+                    platform=source.platform,
+                    require_platform_override_for={Platform.MATTERMOST},
+                )
+            )
+        except Exception:
+            _reasoning_progress_enabled = (
+                source.platform == Platform.DISCORD
+                and bool(getattr(self, "_show_reasoning", False))
+            )
+        needs_progress_queue = (
+            tool_progress_enabled or _thinking_enabled or _reasoning_progress_enabled
+        )
 
 
         # Queue for progress messages (thread-safe)
@@ -19148,6 +19258,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
+
+        _reasoning_progress_parts: List[str] = []
+        _last_reasoning_progress_message: List[str] = [""]
+        _last_reasoning_progress_emit_ts = [0.0]
+        _REASONING_PROGRESS_EDIT_INTERVAL = 1.5
+
+        def _queue_reasoning_progress(*, force: bool = False) -> None:
+            if not progress_queue or not _run_still_current():
+                return
+            if not _reasoning_progress_parts:
+                return
+            rendered = _format_discord_reasoning_progress_message(
+                "".join(_reasoning_progress_parts)
+            )
+            if not rendered or rendered == _last_reasoning_progress_message[0]:
+                return
+            now = time.monotonic()
+            if (
+                not force
+                and _last_reasoning_progress_message[0]
+                and now - _last_reasoning_progress_emit_ts[0] < _REASONING_PROGRESS_EDIT_INTERVAL
+            ):
+                return
+            _last_reasoning_progress_message[0] = rendered
+            _last_reasoning_progress_emit_ts[0] = now
+            progress_queue.put(("__reasoning__", rendered))
+
+        def reasoning_progress_callback(text: str) -> None:
+            """Callback invoked by agent as reasoning/thinking text streams."""
+            if not _reasoning_progress_enabled or not progress_queue:
+                return
+            if not _run_still_current():
+                return
+            chunk = str(text or "")
+            if not chunk:
+                return
+            _reasoning_progress_parts.append(chunk)
+            _queue_reasoning_progress()
+
+        def _flush_reasoning_progress_callback() -> None:
+            _queue_reasoning_progress(force=True)
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
@@ -19294,7 +19445,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and args["command"].strip()
             ):
                 from agent.display import get_tool_preview_max_len
-                _cmd_full = args["command"].rstrip()
+                from agent.display import _fence_safe as _fs
+                _cmd_full = _fs(args["command"].rstrip())
                 # Consecutive terminal calls: drop the repeated
                 # "💻 terminal" header so back-to-back commands render as
                 # adjacent code blocks under a single header.
@@ -19321,16 +19473,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     progress_queue.put(_code_block_full)
                     return
                 last_was_terminal_block[0] = False
+                # Rich emitter: on markdown-capable platforms, render a
+                # header + fenced/capped/fence-safe body (```python for
+                # execute_code, ```diff for patch, ```lang for write_file,
+                # one-liner for read_file) instead of dumping raw escaped
+                # json.dumps(args).  Gated on display.rich_tool_preview
+                # (default on) so it can be disabled without a code change and
+                # survives `hermes update`.  Falls back to the legacy
+                # key-list + JSON form for any tool the rich builder declines.
+                _rich = None
+                try:
+                    _rich_on = is_truthy_value(
+                        cfg_get(_load_gateway_config(), "display", "rich_tool_preview"),
+                        default=True,
+                    )
+                except Exception:
+                    _rich_on = True
+                if (
+                    _rich_on
+                    and args
+                    and getattr(_progress_adapter, "supports_code_blocks", False)
+                ):
+                    try:
+                        from agent.display import build_rich_tool_preview
+                        _rich = build_rich_tool_preview(
+                            tool_name, args, emoji=emoji,
+                        )
+                    except Exception as _rich_err:
+                        logger.debug("rich tool preview failed: %s", _rich_err)
+                        _rich = None
+                if _rich is not None:
+                    progress_queue.put(_rich)
+                    return
+                # No rich fenced view for this tool (not execute_code/patch/
+                # write_file/read_file) — emit a clean compact one-liner from
+                # build_tool_preview (e.g. "skill_view · soria-discord-style",
+                # "todo · planning 2 tasks", "search_files · load_dotenv")
+                # instead of the legacy raw json.dumps(args) dump, which
+                # rendered as an ugly escaped "(['name'])\n{...}" blob.
                 if args:
-                    from agent.display import get_tool_preview_max_len
-                    _pl = get_tool_preview_max_len()
-                    args_str = json.dumps(args, ensure_ascii=False, default=str)
-                    # When tool_preview_length is 0 (default), don't truncate
-                    # in verbose mode — the user explicitly asked for full
-                    # detail.  Platform message-length limits handle the rest.
-                    if _pl > 0 and len(args_str) > _pl:
-                        args_str = args_str[:_pl - 3] + "..."
-                    msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                    from agent.display import build_tool_preview as _btp_fallback
+                    _ol = None
+                    try:
+                        _ol = _btp_fallback(tool_name, args)
+                    except Exception:
+                        _ol = None
+                    if _ol:
+                        msg = f"{emoji} {tool_name} · {_ol}"
+                    else:
+                        msg = f"{emoji} {tool_name}..."
                 elif preview:
                     msg = f"{emoji} {tool_name}: \"{preview}\""
                 else:
@@ -19490,6 +19681,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
+            reasoning_msg_id = None  # ID of the live reasoning sidecar message
             can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
@@ -19574,6 +19766,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _track_progress_result(result)
                 return result
 
+            async def _send_or_edit_reasoning_progress(text: str) -> None:
+                """Send/update the live Discord reasoning sidecar bubble."""
+                nonlocal reasoning_msg_id
+                if not text:
+                    return
+                if reasoning_msg_id is not None:
+                    result = await _edit_progress_message(reasoning_msg_id, text)
+                    if getattr(result, "success", False):
+                        return
+                    reasoning_msg_id = None
+                result = await _send_progress_text(text)
+                if getattr(result, "success", False) and getattr(result, "message_id", None):
+                    reasoning_msg_id = result.message_id
+
+            async def _flush_progress_buffer() -> None:
+                """Deliver the current editable buffer and close it.
+
+                Used before/after atomic Discord code-preview bubbles so later
+                tool cards never get appended into the same Markdown parse.
+                """
+                nonlocal progress_msg_id, progress_lines, can_edit
+                if not progress_lines:
+                    progress_msg_id = None
+                    return
+                await _roll_progress_overflow_if_needed()
+                if not progress_lines:
+                    progress_msg_id = None
+                    return
+                text = _progress_text(progress_lines)
+                if can_edit and progress_msg_id is not None:
+                    result = await _edit_progress_message(progress_msg_id, text)
+                    if not getattr(result, "success", False):
+                        can_edit = False
+                        await _send_progress_text(text)
+                else:
+                    await _send_progress_text(text)
+                progress_lines = []
+                progress_msg_id = None
+
             async def _roll_progress_overflow_if_needed() -> bool:
                 """Start fresh editable progress bubbles before a bubble exceeds limit.
 
@@ -19638,6 +19869,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
+                    # Live reasoning is a sidecar progress bubble: update the
+                    # same Discord subtext message instead of appending token
+                    # deltas into the tool-progress line buffer.
+                    if isinstance(raw, tuple) and len(raw) >= 2 and raw[0] == "__reasoning__":
+                        await _send_or_edit_reasoning_progress(str(raw[1] or ""))
+                        _last_edit_ts = time.monotonic()
+                        if _run_still_current():
+                            await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                        continue
+
                     # Handle dedup messages: update last line with repeat counter
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
@@ -19660,6 +19901,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     else:
                         msg = raw
+                        if can_edit and _progress_message_requires_atomic_bubble(source.platform, msg):
+                            await _flush_progress_buffer()
+                            await _send_progress_text(str(msg))
+                            progress_msg_id = None
+                            progress_lines = []
+                            _last_edit_ts = time.monotonic()
+                            if _run_still_current():
+                                await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                            continue
                         progress_lines.append(msg)
 
                     if await _roll_progress_overflow_if_needed():
@@ -19761,7 +20011,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            if isinstance(raw, tuple) and len(raw) >= 2 and raw[0] == "__reasoning__":
+                                await _send_or_edit_reasoning_progress(str(raw[1] or ""))
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
@@ -19782,17 +20034,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 last_progress_msg[0] = None
                                 repeat_count[0] = 0
                             else:
-                                progress_lines.append(raw)
-                                await _roll_progress_overflow_if_needed()
+                                if can_edit and _progress_message_requires_atomic_bubble(source.platform, raw):
+                                    await _flush_progress_buffer()
+                                    await _send_progress_text(str(raw))
+                                    progress_msg_id = None
+                                    progress_lines = []
+                                else:
+                                    progress_lines.append(raw)
+                                    await _roll_progress_overflow_if_needed()
                         except Exception:
                             break
-                    # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
-                        await _roll_progress_overflow_if_needed()
-                    if can_edit and progress_lines and progress_msg_id:
-                        full_text = _progress_text(progress_lines)
+                    # Final delivery with all remaining tools.  ``progress_msg_id``
+                    # can be None after an atomic Discord fenced preview, so use
+                    # the common buffer flusher instead of an edit-only tail.
+                    if progress_lines:
                         try:
-                            await _edit_progress_message(progress_msg_id, full_text)
+                            await _flush_progress_buffer()
                         except Exception:
                             pass
                     return
@@ -20372,6 +20629,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
+            agent.reasoning_callback = (
+                reasoning_progress_callback
+                if (_reasoning_progress_enabled and _want_stream_deltas and progress_queue is not None)
+                else None
+            )
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             # Credits / out-of-band notices (usage bands, depletion, restored).
@@ -20921,6 +21183,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+            try:
+                _flush_reasoning_progress_callback()
+            except Exception:
+                pass
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done

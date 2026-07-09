@@ -2380,7 +2380,6 @@ class TestStripOrphanCloseTags:
         assert "trailing prose" in consumer._accumulated
         assert "more" in consumer._accumulated
 
-
 class TestHasDeliveredTextAfterSegmentBreak:
     """has_delivered_text must find a delivered segment after a segment break,
     but must not claim text from a failed delivery. (#65919 review)"""
@@ -2416,3 +2415,63 @@ class TestHasDeliveredTextAfterSegmentBreak:
         c._reset_segment_state()
         assert c.has_delivered_text("") is False
         assert c.has_delivered_text("   ") is False
+
+
+# ── Fence-aware streaming overflow split ─────────────────────────────────
+
+
+class TestSplitPreservingFences:
+    """_split_preserving_fences keeps triple-backtick blocks balanced when the
+    streaming edit-overflow branch peels a chunk off an already-sent message.
+
+    Regression for the Discord inversion bug: a split landing inside an open
+    ```` ``` ```` block rendered the sealed chunk's tail and the remainder as
+    inverted formatting (prose inside code boxes, list text outside, visible
+    language labels).
+    """
+
+    def test_split_inside_fence_seals_and_reopens(self):
+        text = "Intro line\n```diff\n- old line\n+ new line\nmore body\n```\nAfter."
+        # Split right after the "+ new line" — inside the open diff fence.
+        split_at = text.index("more body")
+        chunk, remaining = GatewayStreamConsumer._split_preserving_fences(
+            text, split_at,
+        )
+        # Each message is independently fence-balanced.
+        assert chunk.count("```") % 2 == 0
+        assert remaining.count("```") % 2 == 0
+        # Sealed chunk ends with a closing fence; remainder reopens same lang.
+        assert chunk.endswith("```")
+        assert remaining.startswith("```diff\n")
+        # No content lost across the split.
+        assert "more body" in remaining
+        assert "After." in remaining
+
+    def test_split_outside_fence_is_untouched(self):
+        text = "Para one.\n```python\nx = 1\n```\nPara two is long here.\nPara three."
+        # Split in plain prose AFTER the closed fence.
+        split_at = text.index("Para three.")
+        chunk, remaining = GatewayStreamConsumer._split_preserving_fences(
+            text, split_at,
+        )
+        # No extra fences injected — both halves already balanced.
+        assert chunk.count("```") == 2
+        assert remaining.count("```") == 0
+        assert not chunk.endswith("```\n```")
+        assert remaining.startswith("Para three.")
+
+    def test_remainder_closing_fence_is_consumed_not_duplicated(self):
+        # Split lands inside the fence with the closing ``` as the very next
+        # content line — it should be consumed, not reopened into an empty block.
+        text = "Head\n```\nline a\nline b\n```\ntail"
+        split_at = text.index("line b")
+        chunk, remaining = GatewayStreamConsumer._split_preserving_fences(
+            text, split_at,
+        )
+        assert chunk.endswith("```")
+        assert chunk.count("```") % 2 == 0
+        assert remaining.count("```") % 2 == 0
+        # The remainder must not start with an empty reopened+closed block.
+        assert not remaining.startswith("```\n```")
+        assert "line b" in remaining
+        assert "tail" in remaining
