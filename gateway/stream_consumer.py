@@ -713,7 +713,15 @@ class GatewayStreamConsumer:
                         split_at = self._accumulated.rfind("\n", 0, _cp_budget)
                         if split_at < _safe_limit // 2:
                             split_at = _safe_limit
-                        chunk = self._accumulated[:split_at]
+                        # Fence-aware split: seal an open ``` block at the end of
+                        # this chunk and reopen it on the remainder so neither
+                        # message renders inverted (the streaming counterpart to
+                        # truncate_message's fence handling).  _fence_remainder
+                        # is only committed to _accumulated after a successful
+                        # edit below, so the fallback path still sees full text.
+                        chunk, _fence_remainder = self._split_preserving_fences(
+                            self._accumulated, split_at,
+                        )
                         # finalize=True so the adapter applies platform-specific
                         # rich-text markup (e.g. Telegram MarkdownV2). This
                         # sealed chunk will never be edited again — _message_id
@@ -734,7 +742,7 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        self._accumulated = _fence_remainder
                         self._message_id = None
                         self._last_sent_text = ""
 
@@ -981,6 +989,63 @@ class GatewayStreamConsumer:
         if remaining:
             chunks.append(remaining)
         return chunks
+
+    @staticmethod
+    def _split_preserving_fences(text: str, split_at: int) -> tuple[str, str]:
+        """Split *text* at *split_at* keeping triple-backtick fences balanced.
+
+        The streaming edit-overflow branch peels one chunk off an
+        already-sent message and starts a new message with the remainder.  A
+        naive newline slice can land *inside* an open ```` ``` ```` block, which
+        makes Discord render the sealed chunk's tail and the entire remainder
+        as inverted formatting (prose inside code boxes, list text outside,
+        visible ``text`` language labels).  This mirrors the fence-aware logic
+        in ``BasePlatformAdapter.truncate_message`` but for the single-split
+        edit path.
+
+        Returns ``(chunk, remaining)`` where *chunk* is sealed with a closing
+        fence when the split lands inside a code block, and *remaining* has the
+        same-language fence reopened so each message is independently valid.
+        When the remainder's first content line is the original closing fence,
+        that fence is consumed instead of reopening into an empty block.
+        """
+        chunk = text[:split_at]
+        remaining = text[split_at:]
+
+        # Walk the chunk to find the fence state at its end.
+        in_code = False
+        lang = ""
+        for line in chunk.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if in_code:
+                    in_code = False
+                    lang = ""
+                else:
+                    in_code = True
+                    tag = stripped[3:].strip()
+                    lang = tag.split()[0] if tag else ""
+
+        if not in_code:
+            return chunk, remaining.lstrip("\n")
+
+        # Split landed inside an open fence — seal the chunk.
+        sealed = chunk.rstrip("\n") + "\n```"
+        remaining = remaining.lstrip("\n")
+
+        # If the remainder's first non-empty line is the original closing
+        # fence, drop it (we already sealed) so we don't reopen + immediately
+        # close into an empty code block.
+        r_lines = remaining.split("\n")
+        idx = 0
+        while idx < len(r_lines) and r_lines[idx].strip() == "":
+            idx += 1
+        if idx < len(r_lines) and r_lines[idx].strip() == "```":
+            del r_lines[idx]
+            return sealed, "\n".join(r_lines).lstrip("\n")
+
+        # Otherwise reopen the fence (same language tag) on the remainder.
+        return sealed, f"```{lang}\n" + remaining
 
     async def _send_fallback_final(self, text: str) -> None:
         """Send the final continuation after streaming edits stop working.
