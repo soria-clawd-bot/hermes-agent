@@ -662,6 +662,136 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
         return f"{verb} for {preview}"
     return f"{verb} {preview}"
 
+# Rich tool preview — header + fenced, capped, fence-safe body
+# =========================================================================
+
+# File extension → fenced-code language tag for write_file / read_file headers.
+_EXT_LANG = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".tsx": "tsx", ".jsx": "jsx", ".sh": "bash", ".bash": "bash",
+    ".sql": "sql", ".json": "json", ".yaml": "yaml", ".yml": "yaml",
+    ".toml": "toml", ".md": "markdown", ".html": "html", ".css": "css",
+    ".go": "go", ".rs": "rust", ".java": "java", ".rb": "ruby",
+    ".c": "c", ".cpp": "cpp", ".h": "c", ".tf": "hcl", ".xml": "xml",
+}
+
+
+def _fence_safe(text: str) -> str:
+    """Neutralize triple-backtick runs inside body text so they can't break the
+    enclosing fence. A naive ``` -> `\u200b`` escape leaves a 2-backtick run
+    that Discord's inline-code parser pairs with, desyncing the outer fence
+    (the opening ```lang then fails to open as a block). Splitting the 3-run
+    into three INDIVIDUALLY zero-width-space-separated single backticks leaves
+    no run of 2+ backticks, so nothing can be mis-paired. The ZWSP is invisible;
+    inside a code fence the backticks are literal text anyway."""
+    return text.replace("```", "`\u200b`\u200b`")
+
+
+def _short_path(path: str) -> str:
+    """Last two path components — e.g. 'soria-discord-style/SKILL.md'."""
+    parts = str(path).replace("\\", "/").rstrip("/").split("/")
+    return "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else str(path))
+
+
+def _cap_block(lines: list[str], max_lines: int, max_line_len: int) -> tuple[list[str], int]:
+    """Cap a list of body lines to *max_lines* and truncate each to
+    *max_line_len*.  Returns (capped_lines, hidden_count)."""
+    hidden = max(0, len(lines) - max_lines)
+    kept = lines[:max_lines]
+    out = []
+    for ln in kept:
+        ln = ln.rstrip("\n")
+        if len(ln) > max_line_len:
+            ln = ln[:max_line_len - 1] + "…"
+        out.append(_fence_safe(ln))
+    return out, hidden
+
+
+def build_rich_tool_preview(
+    tool_name: str,
+    args: dict,
+    *,
+    emoji: str = "",
+    max_lines: int = 20,
+    max_line_len: int = 120,
+) -> str | None:
+    """Build a premium, multi-line tool-progress preview: a header line plus a
+    fenced, length-capped, fence-safe body that shows *what the tool is doing*
+    (code, diff, file content) without dumping raw escaped JSON.
+
+    Deterministic — no model calls.  Returns the full string to display, or
+    ``None`` for tools that should fall back to a compact one-liner (the caller
+    uses ``build_tool_preview``).  Only emit this on markdown-capable platforms.
+    """
+    if not isinstance(args, dict) or not args:
+        return None
+    head = f"{emoji} {tool_name}".strip()
+
+    # execute_code → ```python with the code body.
+    if tool_name == "execute_code":
+        code = args.get("code")
+        if not isinstance(code, str) or not code.strip():
+            return None
+        lines, hidden = _cap_block(code.splitlines(), max_lines, max_line_len)
+        body = "\n".join(lines)
+        out = f"{head}\n```python\n{body}\n```"
+        if hidden:
+            out += f"\n-# … +{hidden} more lines"
+        return out
+
+    # patch → ```diff built from old_string (−) / new_string (+).
+    if tool_name == "patch":
+        old = args.get("old_string")
+        new = args.get("new_string")
+        path = args.get("path") or args.get("file_path")
+        if not isinstance(old, str) and not isinstance(new, str):
+            return None
+        half = max(2, max_lines // 2)
+        diff_lines: list[str] = []
+        old_l, old_hidden = _cap_block((old or "").splitlines(), half, max_line_len)
+        new_l, new_hidden = _cap_block((new or "").splitlines(), half, max_line_len)
+        diff_lines += [f"- {l}" for l in old_l]
+        diff_lines += [f"+ {l}" for l in new_l]
+        if not diff_lines:
+            return None
+        hdr = f"{head} · {_short_path(path)}" if path else head
+        body = "\n".join(diff_lines)
+        out = f"{hdr}\n```diff\n{body}\n```"
+        if old_hidden or new_hidden:
+            out += f"\n-# … +{old_hidden + new_hidden} more lines"
+        return out
+
+    # write_file → ```{lang} with the content body.
+    if tool_name == "write_file":
+        content = args.get("content")
+        path = args.get("path") or ""
+        if not isinstance(content, str) or not content.strip():
+            return None
+        ext = "." + path.rsplit(".", 1)[-1].lower() if "." in str(path) else ""
+        lang = _EXT_LANG.get(ext, "")
+        lines, hidden = _cap_block(content.splitlines(), max_lines, max_line_len)
+        body = "\n".join(lines)
+        hdr = f"{head} · {_short_path(path)}" if path else head
+        out = f"{hdr}\n```{lang}\n{body}\n```"
+        if hidden:
+            out += f"\n-# … +{hidden} more lines"
+        return out
+
+    # read_file → compact one-liner with the line range (a read shows no body).
+    if tool_name == "read_file":
+        path = args.get("path")
+        if not path:
+            return None
+        offset = args.get("offset")
+        limit = args.get("limit")
+        rng = ""
+        if isinstance(offset, int):
+            end = offset + limit - 1 if isinstance(limit, int) else ""
+            rng = f":{offset}–{end}" if end != "" else f":{offset}"
+        return f"{head} · {_short_path(path)}{rng}"
+
+    # Everything else → fall back to the one-liner builder.
+    return None
 
 # =========================================================================
 # Inline diff previews for write actions
