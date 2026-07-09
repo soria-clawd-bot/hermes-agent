@@ -899,7 +899,7 @@ class SessionDB:
     # 'optimize' is a no-op once the index is already merged, so an idle DB
     # pays almost nothing; the cadence is deliberately coarse so the one-off
     # merge cost is amortised far below the checkpoint cadence.
-    _OPTIMIZE_EVERY_N_WRITES = 1000
+    _OPTIMIZE_EVERY_N_WRITES = 10_000_000  # soria hotfix (auto re-applied by soria_optimize_guard.sh): see NousResearch/hermes-agent#22478
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or DEFAULT_DB_PATH
