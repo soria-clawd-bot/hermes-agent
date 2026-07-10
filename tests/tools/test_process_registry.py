@@ -971,6 +971,381 @@ class TestProcessToolHandler:
 from tools.process_registry import format_process_notification
 
 
+def test_format_completion_event():
+    evt = {
+        "type": "completion",
+        "session_id": "proc_abc",
+        "command": "sleep 5",
+        "exit_code": 0,
+        "output": "done",
+    }
+    result = format_process_notification(evt)
+    assert "[IMPORTANT: Background process proc_abc completed normally" in result
+    assert "exit code 0" in result
+    assert "Command: sleep 5" in result
+    assert "Output:\ndone]" in result
+
+
+def test_format_killed_completion_event_names_source_and_signal():
+    evt = {
+        "type": "completion",
+        "session_id": "proc_killed",
+        "command": "sleep 5",
+        "exit_code": -15,
+        "completion_reason": "killed",
+        "termination_source": "process.kill",
+        "output": "",
+    }
+    result = format_process_notification(evt)
+    assert "proc_killed terminated by process.kill" in result
+    assert "exit code -15, SIGTERM" in result
+
+
+def test_format_external_sigterm_does_not_claim_agent_kill():
+    evt = {
+        "type": "completion",
+        "session_id": "proc_external",
+        "command": "sleep 5",
+        "exit_code": 143,
+        "output": "",
+    }
+    result = format_process_notification(evt)
+    assert "proc_external exited" in result
+    assert "terminated by" not in result
+    assert "exit code 143, SIGTERM" in result
+
+
+def test_format_watch_match_event():
+    evt = {
+        "type": "watch_match",
+        "session_id": "proc_xyz",
+        "command": "tail -f log",
+        "pattern": "ERROR",
+        "output": "ERROR: disk full",
+        "suppressed": 0,
+    }
+    result = format_process_notification(evt)
+    assert 'watch pattern "ERROR"' in result
+    assert "Matched output:\nERROR: disk full" in result
+
+
+def test_format_watch_match_with_suppressed():
+    evt = {
+        "type": "watch_match",
+        "session_id": "proc_xyz",
+        "command": "tail -f log",
+        "pattern": "WARN",
+        "output": "WARN: low mem",
+        "suppressed": 3,
+    }
+    result = format_process_notification(evt)
+    assert "3 earlier matches were suppressed" in result
+
+
+def test_format_watch_disabled_event():
+    evt = {
+        "type": "watch_disabled",
+        "message": "Watch disabled for proc_xyz: too many matches",
+    }
+    result = format_process_notification(evt)
+    assert "[IMPORTANT: Watch disabled for proc_xyz" in result
+
+
+@pytest.mark.parametrize("evt_type", ["watch_overflow_tripped", "watch_overflow_released"])
+def test_format_watch_overflow_event_uses_summary_message(evt_type):
+    message = f"Global watch circuit breaker: {evt_type}"
+    result = format_process_notification({"type": evt_type, "message": message})
+
+    assert result == f"[IMPORTANT: {message}]"
+    assert "Background process unknown" not in result
+
+
+def test_format_returns_none_for_empty_event():
+    evt = {}
+    result = format_process_notification(evt)
+    assert result is not None
+    assert "unknown" in result
+
+
+def test_drain_notifications_returns_pending_events():
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    process_registry.completion_queue.put({
+        "type": "completion",
+        "session_id": "proc_drain1",
+        "command": "echo hi",
+        "exit_code": 0,
+        "output": "hi",
+    })
+    process_registry.completion_queue.put({
+        "type": "watch_match",
+        "session_id": "proc_drain2",
+        "command": "tail -f x",
+        "pattern": "ERR",
+        "output": "ERR found",
+        "suppressed": 0,
+    })
+
+    try:
+        results = process_registry.drain_notifications()
+        assert len(results) == 2
+        assert results[0][0]["session_id"] == "proc_drain1"
+        assert "proc_drain1 completed normally" in results[0][1]
+        assert results[1][0]["session_id"] == "proc_drain2"
+        assert "watch pattern" in results[1][1]
+    finally:
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+        process_registry._completion_consumed.discard("proc_drain1")
+        process_registry._completion_consumed.discard("proc_drain2")
+
+
+def test_drain_notifications_skips_consumed():
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    process_registry._completion_consumed.add("proc_consumed")
+    process_registry.completion_queue.put({
+        "type": "completion",
+        "session_id": "proc_consumed",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+    })
+
+    try:
+        results = process_registry.drain_notifications()
+        assert len(results) == 0
+    finally:
+        process_registry._completion_consumed.discard("proc_consumed")
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_drain_notifications_can_deliver_poll_observed_for_gateway(registry):
+    event = {
+        "type": "completion",
+        "session_id": "proc_polled",
+        "session_key": "session-a",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "observed but not consumed",
+    }
+    registry._poll_observed.add(event["session_id"])
+    registry.completion_queue.put(event)
+
+    try:
+        results = registry.drain_notifications(
+            session_key="session-a",
+            owns_event=lambda _event: True,
+            skip_poll_observed=False,
+        )
+
+        assert [raw for raw, _ in results] == [event]
+    finally:
+        registry._poll_observed.discard(event["session_id"])
+
+
+@pytest.mark.parametrize(
+    "skip_state", ["_poll_observed", "_completion_consumed"]
+)
+def test_drain_notifications_routes_foreign_before_local_skip(
+    registry, skip_state
+):
+    event = {
+        "type": "completion",
+        "session_id": f"proc_foreign_{skip_state}",
+        "session_key": "session-a",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "foreign",
+    }
+    ownership_calls = []
+    getattr(registry, skip_state).add(event["session_id"])
+    registry.completion_queue.put(event)
+
+    def owns_event(checked_event):
+        ownership_calls.append(checked_event)
+        return False
+
+    try:
+        results = registry.drain_notifications(
+            session_key="session-b",
+            owns_event=owns_event,
+        )
+
+        assert results == []
+        assert ownership_calls == [event]
+        assert registry.completion_queue.get_nowait() == event
+        assert registry.completion_queue.empty()
+    finally:
+        getattr(registry, skip_state).discard(event["session_id"])
+
+
+@pytest.mark.parametrize("event_type", ["", "completion_v2"])
+def test_drain_notifications_unknown_completion_type_skips_consumed(event_type):
+    """Unknown/malformed type strings still use completion suppression."""
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    process_registry._completion_consumed.add("proc_consumed_unknown")
+    process_registry.completion_queue.put({
+        "type": event_type,
+        "session_id": "proc_consumed_unknown",
+        "session_key": "mine",
+        "origin_ui_session_id": "mine-sid",
+        "command": "echo private",
+        "exit_code": 0,
+        "output": "private",
+    })
+
+    try:
+        results = process_registry.drain_notifications(owns_event=lambda _event: True)
+        assert results == []
+    finally:
+        process_registry._completion_consumed.discard("proc_consumed_unknown")
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_drain_notifications_empty_queue():
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    results = process_registry.drain_notifications()
+    assert results == []
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_drain_notifications_filters_addressed_completion_by_owns_event(
+    registry, exit_code
+):
+    owned = {
+        "type": "completion",
+        "session_id": f"proc_owned_{exit_code}",
+        "session_key": "session-a",
+        "command": "safe-test-command",
+        "exit_code": exit_code,
+        "output": "owned",
+    }
+    foreign = {
+        "type": "completion",
+        "session_id": f"proc_foreign_{exit_code}",
+        "session_key": "session-b",
+        "command": "safe-test-command",
+        "exit_code": exit_code,
+        "output": "foreign",
+    }
+    registry.completion_queue.put(owned)
+    registry.completion_queue.put(foreign)
+
+    results = registry.drain_notifications(
+        session_key="session-a",
+        owns_event=lambda event: event.get("session_key") == "session-a",
+    )
+
+    assert [event["session_id"] for event, _ in results] == [
+        f"proc_owned_{exit_code}"
+    ]
+    assert registry.completion_queue.get_nowait() == foreign
+    assert registry.completion_queue.empty()
+
+
+def test_drain_notifications_filters_addressed_completion_by_session_key(registry):
+    owned = {
+        "type": "completion",
+        "session_id": "proc_owned",
+        "session_key": "session-a",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "owned",
+    }
+    foreign = {
+        "type": "completion",
+        "session_id": "proc_foreign",
+        "session_key": "session-b",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "foreign",
+    }
+    registry.completion_queue.put(owned)
+    registry.completion_queue.put(foreign)
+
+    results = registry.drain_notifications(session_key="session-a")
+
+    assert [event["session_id"] for event, _ in results] == ["proc_owned"]
+    assert registry.completion_queue.get_nowait() == foreign
+    assert registry.completion_queue.empty()
+
+
+def test_drain_notifications_session_key_filter_requeues_origin_only_event(registry):
+    event = {
+        "type": "completion",
+        "session_id": "proc_origin_only",
+        "origin_ui_session_id": "ui-session-a",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "done",
+    }
+    registry.completion_queue.put(event)
+
+    results = registry.drain_notifications(session_key="session-a")
+
+    assert results == []
+    assert registry.completion_queue.get_nowait() == event
+    assert registry.completion_queue.empty()
+
+
+def test_drain_notifications_ownerless_completion_preserves_legacy_delivery(registry):
+    event = {
+        "type": "completion",
+        "session_id": "proc_ownerless",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "ownerless",
+    }
+    registry.completion_queue.put(event)
+
+    results = registry.drain_notifications(
+        session_key="session-a",
+        owns_event=lambda _event: False,
+    )
+
+    assert [raw for raw, _ in results] == [event]
+    assert registry.completion_queue.empty()
+
+
+def test_drain_notifications_ownerless_async_delegation_still_requires_proof(registry):
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_ownerless",
+        "goal": "task",
+        "status": "completed",
+        "summary": "done",
+        "api_calls": 1,
+        "duration_seconds": 0.1,
+    }
+    registry.completion_queue.put(event)
+
+    results = registry.drain_notifications(
+        session_key="session-a",
+        owns_event=lambda _event: False,
+    )
+
+    assert results == []
+    assert registry.completion_queue.get_nowait() == event
+    assert registry.completion_queue.empty()
+
+
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):
     event = {
         "type": "completion",
@@ -1094,6 +1469,159 @@ def test_drain_notifications_owns_event_callback_beats_key_equality():
     finally:
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_drain_notifications_owns_event_callback_fails_closed():
+    """A broken ownership callback must re-queue (never leak) the event."""
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    try:
+        events = [
+            {
+                "type": "completion",
+                "session_id": "proc_x",
+                "session_key": "k",
+            },
+            {
+                "type": "async_delegation",
+                "delegation_id": "deleg_x",
+                "session_key": "k",
+                "goal": "task", "status": "completed", "summary": "s",
+                "api_calls": 1, "duration_seconds": 0.1,
+            },
+        ]
+        for event in events:
+            process_registry.completion_queue.put(event)
+
+        def broken(_evt):
+            raise RuntimeError("ownership check exploded")
+
+        results = process_registry.drain_notifications(
+            session_key="k", owns_event=broken
+        )
+        assert results == []
+        assert [
+            process_registry.completion_queue.get_nowait()
+            for _ in range(len(events))
+        ] == events
+    finally:
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_drain_notifications_ownership_callback_filters_every_conversation_event():
+    """The TUI post-turn drain must not bypass ownership for process events."""
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    events = [
+        {
+            "type": "completion",
+            "session_id": "proc_foreign",
+            "session_key": "foreign",
+            "command": "print secret",
+            "output": "foreign output",
+        },
+        {
+            "type": "watch_match",
+            "session_id": "watch_foreign",
+            "session_key": "foreign",
+            "pattern": "done",
+        },
+        {
+            "type": "watch_disabled",
+            "session_id": "disabled_foreign",
+            "session_key": "foreign",
+            "message": "watching disabled",
+        },
+        {
+            "type": "watch_overflow_tripped",
+            "session_id": "",
+            "session_key": "",
+            "message": "global overflow",
+        },
+        {
+            "type": "watch_overflow_released",
+            "session_id": "",
+            "session_key": "",
+            "message": "global overflow released",
+        },
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_foreign",
+            "session_key": "foreign",
+            "goal": "task",
+            "status": "completed",
+            "summary": "delegation output",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+        },
+        {
+            # Legacy completion events omitted type.
+            "session_id": "proc_legacy_foreign",
+            "session_key": "foreign",
+            "command": "legacy command",
+            "output": "legacy output",
+        },
+    ]
+    try:
+        for event in events:
+            process_registry.completion_queue.put(event)
+
+        results = process_registry.drain_notifications(
+            session_key="mine",
+            owns_event=lambda _event: False,
+        )
+
+        assert results == []
+        assert [
+            process_registry.completion_queue.get_nowait()
+            for _ in range(len(events))
+        ] == events
+    finally:
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+@pytest.mark.parametrize("raw_type", [None, 42, [], {}])
+def test_format_process_notification_normalizes_invalid_types(raw_type):
+    result = format_process_notification(
+        {
+            "type": raw_type,
+            "session_id": "proc_invalid_type",
+            "command": "echo done",
+            "exit_code": 0,
+            "output": "done",
+        }
+    )
+
+    assert "proc_invalid_type completed normally" in result
+
+
+def test_drain_notifications_normalizes_completion_type_before_consumed_check():
+    registry = ProcessRegistry()
+    events = [
+        {"session_id": "proc_legacy"},
+        {"type": None, "session_id": "proc_invalid"},
+    ]
+    registry._completion_consumed.update({"proc_legacy", "proc_invalid"})
+    for event in events:
+        registry.completion_queue.put(event)
+
+    assert registry.drain_notifications(owns_event=lambda _event: True) == []
+
+
+def test_process_session_fifth_positional_argument_remains_pid():
+    """Adding routing metadata must not silently break the public constructor order."""
+    session = ProcessSession("proc_positional", "echo hi", "task", "session", 4242)
+
+    assert session.pid == 4242
+    assert session.origin_ui_session_id == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1533,4 +2061,3 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-

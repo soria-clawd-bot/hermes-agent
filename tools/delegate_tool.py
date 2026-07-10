@@ -2177,8 +2177,14 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from gateway.session_context import bind_ui_session_id
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with (
+                delegated_child_context(str(getattr(child, "session_id", "") or "")),
+                bind_ui_session_id(
+                    str(getattr(child, "_origin_ui_session_id", "") or "")
+                ),
+            ):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -2974,6 +2980,18 @@ def delegate_task(
             )
             child._live_transcript_path = str(_writer.path)
         children.append((i, t, child))
+
+    # Child execution crosses two executor boundaries, neither of which
+    # inherits ContextVars. Preserve only the parent's WebUI return address;
+    # execution ownership remains the child's own task/session key.
+    try:
+        from gateway.session_context import get_session_env
+
+        _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+    except Exception:
+        _origin_ui_session_id = ""
+    for _, _, child in children:
+        child._origin_ui_session_id = _origin_ui_session_id
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,

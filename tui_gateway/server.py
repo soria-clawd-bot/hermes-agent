@@ -8745,14 +8745,30 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     minus its orphan-adoption fallback. An event owns-matches when its
     ``origin_ui_session_id`` is this live session, or its ``session_key``
     (raw or resolved through the compression chain) matches this session's
-    key/lineage. Used as the fail-closed gate for every addressed notification:
-    "not provably elsewhere" is NOT good enough to inject a payload into this
-    chat (#55578).
+    key/lineage. Used as a fail-closed gate for all notification payloads:
+    "not provably elsewhere" is NOT good enough to inject a conversation
+    payload into this chat (#55578).
     """
     if session.get("_finalized"):
         return False
-    if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
-        return True
+    evt_ui_sid = str(evt.get("origin_ui_session_id") or "")
+    if evt_ui_sid:
+        if evt_ui_sid == str(sid or ""):
+            return True
+        try:
+            with _sessions_lock:
+                owner_live = (
+                    evt_ui_sid in _sessions
+                    and not _sessions[evt_ui_sid].get("_finalized")
+                )
+        except Exception:
+            # We cannot prove the named owner is gone, so key fallback would
+            # risk injecting its payload into another live chat.
+            return False
+        if owner_live:
+            return False
+        # Only a confirmed-dead exact UI owner may fall back to durable-key
+        # lineage (for example, a resumed post-compression continuation).
     evt_key = str(evt.get("session_key") or "")
     if not evt_key:
         return False
@@ -8760,23 +8776,61 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
         str(session.get("session_key") or ""),
         _session_lookup_key(session, fallback=sid),
     }
-    if evt_key in current_keys:
-        return True
     try:
         db = _get_db()
         resolved_key = (
             db.resolve_resume_session_id(evt_key) if db is not None else evt_key
         ) or evt_key
     except Exception:
-        resolved_key = evt_key
-    return resolved_key in current_keys
+        # Without a reliable continuation lookup, raw-key ownership may be a
+        # stale parent rather than the current conversation tip.
+        return False
+
+    target_key = resolved_key
+    if target_key not in current_keys:
+        return False
+
+    # Legacy events can lack origin_ui_session_id. A durable key is positive
+    # proof only when it identifies exactly one live UI session; otherwise the
+    # process-wide queue would let poller scheduling choose the destination.
+    try:
+        with _sessions_lock:
+            matches = [
+                candidate_sid
+                for candidate_sid, candidate in _sessions.items()
+                if (
+                    not candidate.get("_finalized")
+                    and (
+                        str(candidate.get("session_key") or "") == target_key
+                        or _session_lookup_key(candidate, fallback="") == target_key
+                    )
+                )
+            ]
+    except Exception:
+        return False
+    return len(matches) == 1 and matches[0] == str(sid or "")
 
 
-def _notification_event_requires_owner(evt: dict) -> bool:
-    """Whether ``evt`` must be positively claimed before TUI delivery."""
-    return evt.get("type") == "async_delegation" or bool(
-        str(evt.get("origin_ui_session_id") or "")
-        or str(evt.get("session_key") or "")
+def _notification_event_type(evt: dict) -> str:
+    """Normalize event types exactly like the shared formatter/drain path."""
+    from tools.process_registry import _normalize_notification_event_type
+
+    return _normalize_notification_event_type(evt)
+
+
+def _notification_event_must_fail_closed(sid: str, session: dict, evt: dict) -> bool:
+    """True when a process notification has no provable owner in this chat.
+
+    Process output remains available in the registry, so dropping an unowned
+    synthetic chat injection is safer than the historical orphan-adoption
+    fallback.
+    """
+    evt_type = _notification_event_type(evt)
+    # The formatter treats missing, malformed, and unknown non-delegation
+    # types as process completions. Gate that entire fallback surface rather
+    # than maintaining an allowlist that future event variants can bypass.
+    return evt_type != "async_delegation" and not _session_owns_notification_event(
+        sid, session, evt
     )
 
 
@@ -8789,7 +8843,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     different patterns many times, so include event-specific content to avoid
     suppressing later distinct matches from the same process.
     """
-    evt_type = evt.get("type", "completion")
+    evt_type = _notification_event_type(evt)
     evt_sid = evt.get("session_id", "")
     if evt_type == "watch_match":
         return (
@@ -9060,30 +9114,41 @@ def _notification_poller_loop(
             time.sleep(0.1)
             continue
 
-        # What reaches here is not owned by another LIVE session. Addressed
-        # events still require positive proof before injection: exact UI origin,
-        # direct durable key, or compression lineage. If none proves ownership,
-        # the event is orphaned and must not be adopted by this chat. Truly
-        # ownerless ordinary notifications retain legacy global delivery.
-        requires_owner = _notification_event_requires_owner(evt)
-        if requires_owner and not _session_owns_notification_event(sid, session, evt):
-            log = (
-                logger.warning
-                if evt.get("type") == "async_delegation"
-                else logger.debug
-            )
-            log(
-                "Dropping unowned %s notification (origin=%r key=%r) instead "
-                "of delivering to session %s",
-                evt.get("type", "completion"),
+        # Fail closed for conversation-bearing notifications. The
+        # belongs-elsewhere check above already re-queued events owned by
+        # another LIVE session; what reaches here is either ours or an orphan
+        # whose owner is gone. Async delegation results remain in delegation
+        # records, and process output remains in the process registry, so a
+        # silent orphan is recoverable while wrong-chat injection is not.
+        evt_type = _notification_event_type(evt)
+        if evt_type == "async_delegation" and not _session_owns_notification_event(
+            sid, session, evt
+        ):
+            logger.warning(
+                "async-delegation completion %s has no live owner "
+                "(origin=%r key=%r); dropping from injection instead of "
+                "delivering to session %s (#55578 fail-closed; result "
+                "remains in the delegation records)",
+                evt.get("delegation_id", "?"),
                 str(evt.get("origin_ui_session_id") or ""),
                 str(evt.get("session_key") or ""),
                 sid,
             )
             continue
 
+        if _notification_event_must_fail_closed(sid, session, evt):
+            logger.warning(
+                "process notification %s has no live owner "
+                "(process=%s origin=%r key=%r); dropping chat injection",
+                evt.get("type", "?"),
+                evt.get("session_id", "?"),
+                str(evt.get("origin_ui_session_id") or ""),
+                str(evt.get("session_key") or ""),
+            )
+            continue
+
         _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+        if evt_type == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
 
         text = format_process_notification(evt)
@@ -9157,24 +9222,28 @@ def _notification_poller_loop(
         if _notification_event_belongs_elsewhere(sid, session, evt):
             deferred.append(evt)
             continue
-        # Same positive-proof rule as the live loop. Preserve the existing
-        # shutdown behavior for orphaned delegation payloads by deferring them
-        # for a later resume; ordinary addressed orphans are dropped.
-        requires_owner = _notification_event_requires_owner(evt)
-        if requires_owner and not _session_owns_notification_event(sid, session, evt):
-            if evt.get("type") == "async_delegation":
-                deferred.append(evt)
-            else:
-                logger.debug(
-                    "Dropping unowned %s notification during shutdown drain "
-                    "(origin=%r key=%r)",
-                    evt.get("type", "completion"),
-                    str(evt.get("origin_ui_session_id") or ""),
-                    str(evt.get("session_key") or ""),
-                )
+        # Same fail-closed rule as the live loop: an orphaned async-delegation
+        # payload is never adopted by a foreign session — defer it (a later
+        # resume of the owner's lineage can still claim it) rather than
+        # injecting another chat's conversation here (#55578).
+        evt_type = _notification_event_type(evt)
+        if evt_type == "async_delegation" and not _session_owns_notification_event(
+            sid, session, evt
+        ):
+            deferred.append(evt)
+            continue
+        if _notification_event_must_fail_closed(sid, session, evt):
+            logger.warning(
+                "process notification %s has no live owner during drain "
+                "(process=%s origin=%r key=%r); dropping chat injection",
+                evt.get("type", "?"),
+                evt.get("session_id", "?"),
+                str(evt.get("origin_ui_session_id") or ""),
+                str(evt.get("session_key") or ""),
+            )
             continue
         _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+        if evt_type == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
         text = format_process_notification(evt)
         if not text:
@@ -9254,6 +9323,22 @@ def _async_delegation_display_metadata(evt: dict) -> dict:
     return metadata
 
 
+def _claim_post_turn_notification(
+    session: dict,
+    process_registry,
+    drained: list[tuple[dict, str]],
+    index: int,
+) -> bool:
+    """Claim one drained event or requeue its entire unprocessed suffix."""
+    with session["history_lock"]:
+        if session.get("running"):
+            for raw_event, _text in drained[index:]:
+                process_registry.completion_queue.put(raw_event)
+            return False
+        session["running"] = True
+    return True
+
+
 def _wire_agent_terminal_output() -> None:
     """Idempotently route background-process output (and tab-close requests) to
     the desktop, keyed by process id. Read-only agent terminal tabs stream
@@ -9271,26 +9356,40 @@ def _wire_agent_terminal_output() -> None:
         return
 
     def _owner_sid_for_process(session) -> str:
-        session_key = str(getattr(session, "session_key", "") or "")
-        if not session_key:
+        evt = {
+            "origin_ui_session_id": str(
+                getattr(session, "origin_ui_session_id", "") or ""
+            ),
+            "session_key": str(getattr(session, "session_key", "") or ""),
+        }
+        try:
+            with _sessions_lock:
+                snapshot = list(_sessions.items())
+        except Exception:
             return ""
-        with _sessions_lock:
-            for sid, tui_session in _sessions.items():
-                if str(tui_session.get("session_key") or "") == session_key:
-                    return sid
-        return ""
+        matches = [
+            candidate_sid
+            for candidate_sid, candidate in snapshot
+            if _session_owns_notification_event(candidate_sid, candidate, evt)
+        ]
+        return matches[0] if len(matches) == 1 else ""
 
     def _emit_agent_terminal_output(session, chunk):
+        sid = _owner_sid_for_process(session)
+        if not sid:
+            return
         _emit(
             "agent.terminal.output",
-            _owner_sid_for_process(session),
+            sid,
             {"process_id": session.id, "chunk": chunk},
         )
 
     def _emit_agent_terminal_close(session, process_id):
-        # session may be None (process already finished/pruned) — the tab can
-        # still linger and be closed; route to the owning window when we can.
+        # session may be None (process already finished/pruned). Without the
+        # process metadata there is no provable owning window, so fail closed.
         sid = _owner_sid_for_process(session) if session is not None else ""
+        if not sid:
+            return
         _emit("terminal.close", sid, {"process_id": process_id})
 
     if not has_output_sink:
@@ -10143,27 +10242,22 @@ def _run_prompt_submit(
 
             # Positive-proof ownership (compression-chain aware) — the same
             # fail-closed gate the poller uses, so the post-turn drain can't
-            # adopt another session's addressed notification while a
-            # post-compression session still claims its own pre-compression
-            # dispatches (#55578).
+            # adopt another session's (or an orphan's) notification payload,
+            # while a post-compression session still claims its own
+            # pre-compression dispatches (#55578).
             drained = process_registry.drain_notifications(
                 session_key=session.get("session_key", ""),
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
             for index, (_evt, synth) in enumerate(drained):
-                with session["history_lock"]:
-                    if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
-                            process_registry.completion_queue.put(pending_evt)
-                        break
-                    session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
-                if _claim is None:
-                    continue
+                if not _claim_post_turn_notification(
+                    session,
+                    process_registry,
+                    drained,
+                    index,
+                ):
+                    break
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)

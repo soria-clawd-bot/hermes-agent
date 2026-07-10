@@ -85,6 +85,56 @@ class TestCheckWatchPatterns:
         assert "disk full" in evt["output"]
         assert evt["session_id"] == "proc_test_watch"
 
+    def test_match_carries_session_key_and_watcher_routing_metadata(self, registry):
+        session = _make_session(watch_patterns=["ERROR"])
+        session.session_key = "agent:main:telegram:group:-100:42"
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "-100"
+        session.watcher_user_id = "u123"
+        session.watcher_user_name = "alice"
+        session.watcher_thread_id = "42"
+        session.origin_ui_session_id = "parent-tab"
+
+        registry._check_watch_patterns(session, "ERROR: disk full\n")
+        evt = registry.completion_queue.get_nowait()
+
+        assert evt["session_key"] == "agent:main:telegram:group:-100:42"
+        assert evt["platform"] == "telegram"
+        assert evt["chat_id"] == "-100"
+        assert evt["user_id"] == "u123"
+        assert evt["user_name"] == "alice"
+        assert evt["thread_id"] == "42"
+        assert evt["origin_ui_session_id"] == "parent-tab"
+
+    def test_multiple_patterns(self, registry):
+        """First matching pattern is reported."""
+        session = _make_session(watch_patterns=["WARN", "ERROR"])
+        registry._check_watch_patterns(session, "ERROR: bad\nWARN: hmm\n")
+        evt = registry.completion_queue.get_nowait()
+        # ERROR appears first in the output, and we check patterns in order
+        # so "WARN" won't match "ERROR: bad" but "ERROR" will
+        assert evt["pattern"] == "ERROR"
+        assert "bad" in evt["output"]
+
+    def test_disabled_skips(self, registry):
+        """Disabled watch produces no notifications."""
+        session = _make_session(watch_patterns=["ERROR"])
+        session._watch_disabled = True
+        registry._check_watch_patterns(session, "ERROR: boom\n")
+        assert registry.completion_queue.empty()
+
+    def test_hit_counter_increments(self, registry):
+        """Each delivered notification increments _watch_hits.
+
+        With 1/15s rate limit, we need to reset cooldown between calls.
+        """
+        session = _make_session(watch_patterns=["X"])
+        registry._check_watch_patterns(session, "X\n")
+        assert session._watch_hits == 1
+        # Reset cooldown so the second match gets delivered.
+        session._watch_cooldown_until = 0.0
+        registry._check_watch_patterns(session, "X\n")
+        assert session._watch_hits == 2
 
     def test_output_truncation(self, registry):
         """Very long matched output is truncated."""
