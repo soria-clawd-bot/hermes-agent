@@ -903,6 +903,31 @@ class TestModelsEndpoint:
             assert len(data["data"]) == 1
             assert data["data"][0]["id"] == "hermes-agent"
             assert data["data"][0]["owned_by"] == "hermes"
+            effort = data["data"][0]["capabilities"]["reasoning_effort"]
+            assert effort["supported"] == [
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultra",
+            ]
+            assert effort["default"] in effort["supported"]
+
+    @pytest.mark.asyncio
+    async def test_models_advertises_configured_reasoning_default(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.run.GatewayRunner._load_reasoning_config",
+                return_value={"enabled": True, "effort": "low"},
+            ):
+                resp = await cli.get("/v1/models")
+
+            data = await resp.json()
+            assert data["data"][0]["capabilities"]["reasoning_effort"]["default"] == "low"
 
     @pytest.mark.asyncio
     async def test_models_returns_profile_name(self):
@@ -1936,6 +1961,57 @@ class TestResponsesEndpoint:
             assert call_kwargs["ephemeral_system_prompt"] == "Talk like a pirate."
 
     @pytest.mark.asyncio
+    async def test_open_webui_render_profile_is_allowlisted_and_idempotent(self, adapter):
+        mock_result = {"final_response": "Done", "messages": [], "api_calls": 1}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                first = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-Render-Profile": "open-webui-v1"},
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Hello",
+                        "instructions": "Be accurate.",
+                    },
+                )
+                first_data = await first.json()
+                second = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-Render-Profile": "open-webui-v1"},
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Continue",
+                        "previous_response_id": first_data["id"],
+                    },
+                )
+
+            assert first.status == 200
+            assert second.status == 200
+            prompt = mock_run.call_args.kwargs["ephemeral_system_prompt"]
+            assert "Be accurate." in prompt
+            assert prompt.count("[Hermes client render profile: open-webui-v1]") == 1
+            assert "Write the final answer exactly once" in prompt
+
+    @pytest.mark.asyncio
+    async def test_unknown_render_profile_is_rejected(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                headers={"X-Hermes-Render-Profile": "untrusted-profile"},
+                json={"model": "hermes-agent", "input": "Hello"},
+            )
+
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"]["param"] == "X-Hermes-Render-Profile"
+
+    @pytest.mark.asyncio
     async def test_previous_response_id_chaining(self, adapter):
         """Test that responses can be chained via previous_response_id."""
         mock_result_1 = {
@@ -2586,18 +2662,20 @@ class TestResponsesStreaming:
                 if event.get("type") == "response.output_item.added"
                 and event.get("item", {}).get("type") == "reasoning"
             ]
-            assert len(reasoning_items) == 2
+            # Progress is committed only when a subsequent tool proves it was
+            # interim. The terminal "Verifying" draft is suppressed because
+            # the final text stream is canonical.
+            assert len(reasoning_items) == 1
             assert [
                 event["delta"]
                 for event in events
                 if event.get("type") == "response.reasoning_summary_text.delta"
-            ] == ["Inspecting live state", "Verifying the result"]
+            ] == ["Inspecting live state"]
 
             completed = next(event["response"] for event in events if event.get("type") == "response.completed")
             completed_reasoning = [item for item in completed["output"] if item.get("type") == "reasoning"]
             assert [item["summary"][0]["text"] for item in completed_reasoning] == [
                 "Inspecting live state",
-                "Verifying the result",
             ]
 
             lifecycle = [
@@ -2610,12 +2688,6 @@ class TestResponsesStreaming:
                 )
             ]
             assert lifecycle == [
-                "response.output_item.added",
-                "response.reasoning_summary_part.added",
-                "response.reasoning_summary_text.delta",
-                "response.reasoning_summary_text.done",
-                "response.reasoning_summary_part.done",
-                "response.output_item.done",
                 "response.output_item.added",
                 "response.reasoning_summary_part.added",
                 "response.reasoning_summary_text.delta",
@@ -2670,6 +2742,48 @@ class TestResponsesStreaming:
                 for event in events
                 if event.get("type") == "response.reasoning_summary_text.delta"
             ] == ["Checking live state"]
+
+    @pytest.mark.asyncio
+    async def test_completed_payload_omits_reasoning_identical_to_final_answer(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                kwargs["reasoning_callback"]("Done.")
+                kwargs["stream_delta_callback"]("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                patch("gateway.run.GatewayRunner._load_show_reasoning", return_value=True),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "finish",
+                        "stream": True,
+                        "reasoning_effort": "high",
+                    },
+                )
+
+            events = []
+            for block in (await resp.text()).split("\n\n"):
+                data_line = next(
+                    (line[6:] for line in block.splitlines() if line.startswith("data: ")),
+                    None,
+                )
+                if data_line and data_line != "[DONE]":
+                    events.append(json.loads(data_line))
+
+            completed = next(
+                event["response"]
+                for event in events
+                if event.get("type") == "response.completed"
+            )
+            assert [item["type"] for item in completed["output"]] == ["message"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

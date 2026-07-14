@@ -98,6 +98,27 @@ RESPONSES_SSE_SNAPSHOT_SECONDS = 1.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 
+RESPONSES_REASONING_EFFORTS = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
+HERMES_RENDER_PROFILE_HEADER = "X-Hermes-Render-Profile"
+_RENDER_PROFILE_PROMPTS = {
+    "open-webui-v1": (
+        "[Hermes client render profile: open-webui-v1]\n"
+        "Write the final answer exactly once. Keep it concise and self-contained. "
+        "Use Markdown headings and lists only when they materially improve readability. "
+        "Do not repeat the final answer in a progress update. During tool work, report only "
+        "material milestones or blockers instead of narrating each routine tool call."
+    ),
+}
+
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
     """Parse a listen port without letting malformed env/config values crash startup."""
@@ -134,6 +155,37 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _apply_render_profile(instructions: Optional[str], profile: Optional[str]) -> Optional[str]:
+    """Append a versioned, byte-stable client formatting contract once."""
+    if not profile:
+        return instructions
+    profile_prompt = _RENDER_PROFILE_PROMPTS[profile]
+    current = instructions if isinstance(instructions, str) else _normalize_chat_content(instructions)
+    if profile_prompt in current:
+        return current
+    return f"{current.rstrip()}\n\n{profile_prompt}" if current.strip() else profile_prompt
+
+
+def _normalized_display_text(value: Any) -> str:
+    """Normalize visible text for conservative exact-duplicate detection."""
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _reasoning_item_duplicates_answer(item: Dict[str, Any], answer: str) -> bool:
+    """Return True only when a reasoning summary is the final answer verbatim."""
+    if item.get("type") != "reasoning" or not answer:
+        return False
+    parts = item.get("summary") or item.get("content") or []
+    if not isinstance(parts, list):
+        return False
+    reasoning_text = "".join(
+        str(part.get("text", ""))
+        for part in parts
+        if isinstance(part, dict)
+    )
+    return bool(reasoning_text) and _normalized_display_text(reasoning_text) == _normalized_display_text(answer)
 
 
 def _normalize_chat_content(
@@ -1477,6 +1529,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         now = int(time.time())
+        reasoning_capability = self._reasoning_effort_capability()
         models = [
             {
                 "id": self._model_name,
@@ -1486,6 +1539,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "permission": [],
                 "root": self._model_name,
                 "parent": None,
+                "capabilities": {"reasoning_effort": reasoning_capability},
             }
         ]
         # Expose configured model route aliases so clients can discover them.
@@ -1502,9 +1556,47 @@ class APIServerAdapter(BasePlatformAdapter):
                 "permission": [],
                 "root": route_cfg.get("model", alias),
                 "parent": self._model_name,
+                "capabilities": {"reasoning_effort": reasoning_capability},
             })
 
         return web.json_response({"object": "list", "data": models})
+
+    @staticmethod
+    def _reasoning_effort_capability() -> Dict[str, Any]:
+        """Advertise the request-local effort contract and configured default."""
+        default = "high"
+        try:
+            from gateway.run import GatewayRunner
+
+            configured = GatewayRunner._load_reasoning_config() or {}
+            if configured.get("enabled") is False:
+                default = "none"
+            elif configured.get("effort") in RESPONSES_REASONING_EFFORTS:
+                default = configured["effort"]
+        except Exception:
+            pass
+        return {
+            "supported": list(RESPONSES_REASONING_EFFORTS),
+            "default": default,
+        }
+
+    @staticmethod
+    def _parse_render_profile_header(
+        request: "web.Request",
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Resolve an allowlisted client render contract from a request header."""
+        profile = request.headers.get(HERMES_RENDER_PROFILE_HEADER, "").strip()
+        if not profile:
+            return None, None
+        if profile not in _RENDER_PROFILE_PROMPTS:
+            return None, web.json_response(
+                _openai_error(
+                    f"Unsupported Hermes render profile: {profile}",
+                    param=HERMES_RENDER_PROFILE_HEADER,
+                ),
+                status=400,
+            )
+        return profile, None
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
@@ -2739,6 +2831,11 @@ class APIServerAdapter(BasePlatformAdapter):
         reasoning_item_id: Optional[str] = None
         reasoning_output_index: Optional[int] = None
         reasoning_text_parts: List[str] = []
+        # Hermes' ``_thinking`` progress event can contain a draft of the final
+        # answer. Hold it until a subsequent tool start proves that it was an
+        # interim milestone; terminal scratch is discarded instead of being
+        # rendered as a second copy of the answer.
+        pending_interim_reasoning: List[str] = []
 
         async def _write_event(event_type: str, data: Dict[str, Any]) -> None:
             nonlocal sequence_number
@@ -2827,6 +2924,15 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_output_index = None
             reasoning_text_parts.clear()
 
+        async def _flush_interim_reasoning() -> None:
+            """Emit buffered progress as one milestone before its next tool."""
+            if not pending_interim_reasoning:
+                return
+            milestone = "\n\n".join(pending_interim_reasoning)
+            pending_interim_reasoning.clear()
+            await _emit_reasoning_delta(milestone)
+            await _close_reasoning_item()
+
         def _envelope(status: str) -> Dict[str, Any]:
             env: Dict[str, Any] = {
                 "id": response_id,
@@ -2904,8 +3010,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 "response": created_env,
             })
             _persist_response_snapshot(created_env)
-            if expose_reasoning:
-                await _open_reasoning_item()
             last_activity = time.monotonic()
             last_snapshot = last_activity
 
@@ -3065,14 +3169,29 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Flush batched text before tool events
                     if _batch_buf:
                         await _flush_batch()
-                    if tag == "__reasoning__":
+                    if tag == "__provider_reasoning__":
+                        # Provider-native reasoning is authoritative. Avoid
+                        # presenting an overlapping synthetic progress draft.
+                        pending_interim_reasoning.clear()
                         await _emit_reasoning_delta(payload)
+                    elif tag == "__interim_reasoning__":
+                        text = str(payload or "").strip()
+                        if text and (
+                            not pending_interim_reasoning
+                            or _normalized_display_text(pending_interim_reasoning[-1])
+                            != _normalized_display_text(text)
+                        ):
+                            pending_interim_reasoning.append(text)
                     elif tag == "__tool_started__":
+                        await _flush_interim_reasoning()
                         await _close_reasoning_item()
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
                 elif isinstance(it, str):
+                    # A progress draft with no following tool is terminal
+                    # scratch. The text stream is the canonical final answer.
+                    pending_interim_reasoning.clear()
                     await _close_reasoning_item()
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -3144,6 +3263,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         _batch_timer = None
                     if _batch_buf:
                         await _flush_batch()
+                    pending_interim_reasoning.clear()
                     break
 
                 await _dispatch(item)
@@ -3152,6 +3272,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Flush any final batched text before processing result
             if _batch_buf:
                 await _flush_batch()
+            pending_interim_reasoning.clear()
             await _close_reasoning_item()
 
             # Pick up agent result + usage from the completed task
@@ -3203,7 +3324,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # response envelope so clients that only parse the terminal
             # payload still see the assistant text.  This mirrors the
             # shape produced by _extract_output_items in the batch path.
-            final_items: List[Dict[str, Any]] = list(emitted_items)
+            final_items: List[Dict[str, Any]] = [
+                item
+                for item in emitted_items
+                if not _reasoning_item_duplicates_answer(item, final_response_text)
+            ]
 
             # Trim large content from tool call arguments to keep the
             # response.completed event under ~100KB.  Clients already
@@ -3361,6 +3486,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        render_profile, render_profile_err = self._parse_render_profile_header(request)
+        if render_profile_err is not None:
+            return render_profile_err
 
         # Parse request body
         try:
@@ -3448,6 +3576,8 @@ class APIServerAdapter(BasePlatformAdapter):
             if instructions is None:
                 instructions = stored.get("instructions")
 
+        instructions = _apply_render_profile(instructions, render_profile)
+
         # Append new input messages to history (all but the last become history)
         for msg in input_messages[:-1]:
             conversation_history.append(msg)
@@ -3499,7 +3629,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             def _on_reasoning_delta(delta):
                 if expose_reasoning and delta:
-                    _stream_q.put(("__reasoning__", str(delta)))
+                    _stream_q.put(("__provider_reasoning__", str(delta)))
 
             def _on_tool_progress(event_type, name=None, preview=None, args=None, **kwargs):
                 """Queue model-visible thinking for Responses reasoning cards."""
@@ -3512,7 +3642,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 else:
                     return
                 if text:
-                    _stream_q.put(("__reasoning__", str(text)))
+                    _stream_q.put(("__interim_reasoning__", str(text)))
 
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Queue a started tool for live function_call streaming."""
@@ -3586,8 +3716,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            fingerprint_body["_hermes_render_profile"] = render_profile
             fp = _make_request_fingerprint(
-                body,
+                fingerprint_body,
                 keys=[
                     "input",
                     "instructions",
@@ -3597,6 +3729,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tools",
                     "reasoning",
                     "reasoning_effort",
+                    "_hermes_render_profile",
                 ],
             )
             try:
@@ -3709,16 +3842,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not has_nested_effort and not has_compat_effort:
             return None, None
 
-        valid_efforts = {
-            "none",
-            "minimal",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-            "max",
-            "ultra",
-        }
+        valid_efforts = set(RESPONSES_REASONING_EFFORTS)
         supplied_efforts = []
         if has_nested_effort:
             supplied_efforts.append(("reasoning.effort", nested.get("effort")))
