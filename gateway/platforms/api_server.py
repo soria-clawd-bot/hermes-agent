@@ -94,6 +94,7 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+RESPONSES_SSE_SNAPSHOT_SECONDS = 1.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 
@@ -2906,6 +2907,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if expose_reasoning:
                 await _open_reasoning_item()
             last_activity = time.monotonic()
+            last_snapshot = last_activity
 
             async def _open_message_item() -> None:
                 """Emit response.output_item.added for the assistant message
@@ -3121,9 +3123,19 @@ class APIServerAdapter(BasePlatformAdapter):
                             except _q.Empty:
                                 break
                         break
-                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                    now = time.monotonic()
+                    if now - last_snapshot >= RESPONSES_SSE_SNAPSHOT_SECONDS:
+                        snapshot_env = _envelope("in_progress")
+                        snapshot_env["output"] = list(emitted_items)
+                        await _write_event("response.in_progress", {
+                            "type": "response.in_progress",
+                            "response": snapshot_env,
+                        })
+                        last_snapshot = now
+                        last_activity = now
+                    elif now - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
                         await response.write(b": keepalive\n\n")
-                        last_activity = time.monotonic()
+                        last_activity = now
                     continue
 
                 if item is None:  # EOS sentinel
