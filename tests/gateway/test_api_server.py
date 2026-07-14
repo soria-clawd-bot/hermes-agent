@@ -2312,6 +2312,60 @@ class TestResponsesStreaming:
                 assert " world" in body
 
     @pytest.mark.asyncio
+    async def test_stream_emits_reasoning_summaries_around_tool_calls(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                progress_cb = kwargs["tool_progress_callback"]
+                start_cb = kwargs["tool_start_callback"]
+                complete_cb = kwargs["tool_complete_callback"]
+                text_cb = kwargs["stream_delta_callback"]
+
+                progress_cb("reasoning.available", "_thinking", "Inspecting live state", None)
+                start_cb("call_123", "read_file", {"path": "/tmp/test.txt"})
+                complete_cb("call_123", "read_file", {"path": "/tmp/test.txt"}, '{"content":"hello"}')
+                progress_cb("reasoning.available", "_thinking", "Verifying the result", None)
+                text_cb("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "inspect it", "stream": True},
+                )
+
+            assert resp.status == 200
+            body = await resp.text()
+            events = []
+            for block in body.split("\n\n"):
+                data_line = next((line[6:] for line in block.splitlines() if line.startswith("data: ")), None)
+                if data_line and data_line != "[DONE]":
+                    events.append(json.loads(data_line))
+
+            reasoning_items = [
+                event["item"]
+                for event in events
+                if event.get("type") == "response.output_item.added"
+                and event.get("item", {}).get("type") == "reasoning"
+            ]
+            assert len(reasoning_items) == 2
+            assert [
+                event["delta"]
+                for event in events
+                if event.get("type") == "response.reasoning_summary_text.delta"
+            ] == ["Inspecting live state", "Verifying the result"]
+
+            completed = next(event["response"] for event in events if event.get("type") == "response.completed")
+            completed_reasoning = [item for item in completed["output"] if item.get("type") == "reasoning"]
+            assert [item["summary"][0]["text"] for item in completed_reasoning] == [
+                "Inspecting live state",
+                "Verifying the result",
+            ]
+
+    @pytest.mark.asyncio
     async def test_stream_string_false_returns_json_response(self, adapter):
         """Quoted false must not route Responses API requests into SSE mode."""
         mock_result = {

@@ -2723,6 +2723,9 @@ class APIServerAdapter(BasePlatformAdapter):
         message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
         message_output_index: Optional[int] = None
         message_opened = False
+        reasoning_item_id: Optional[str] = None
+        reasoning_output_index: Optional[int] = None
+        reasoning_text_parts: List[str] = []
 
         async def _write_event(event_type: str, data: Dict[str, Any]) -> None:
             nonlocal sequence_number
@@ -2731,6 +2734,79 @@ class APIServerAdapter(BasePlatformAdapter):
             sequence_number += 1
             payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
             await response.write(payload.encode())
+
+        async def _emit_reasoning_delta(delta_text: str) -> None:
+            """Stream one Hermes thinking segment as a Responses reasoning summary."""
+            nonlocal reasoning_item_id, reasoning_output_index, output_index
+            if not delta_text:
+                return
+            if reasoning_item_id is None:
+                reasoning_item_id = f"rs_{uuid.uuid4().hex[:24]}"
+                reasoning_output_index = output_index
+                output_index += 1
+                reasoning_text_parts.clear()
+                await _write_event("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": reasoning_output_index,
+                    "item": {
+                        "id": reasoning_item_id,
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [],
+                    },
+                })
+                await _write_event("response.reasoning_summary_part.added", {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": reasoning_item_id,
+                    "output_index": reasoning_output_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                })
+            reasoning_text_parts.append(delta_text)
+            await _write_event("response.reasoning_summary_text.delta", {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": reasoning_item_id,
+                "output_index": reasoning_output_index,
+                "summary_index": 0,
+                "delta": delta_text,
+            })
+
+        async def _close_reasoning_item() -> None:
+            """Finish the active reasoning item before a tool or answer begins."""
+            nonlocal reasoning_item_id, reasoning_output_index
+            if reasoning_item_id is None or reasoning_output_index is None:
+                return
+            text = "".join(reasoning_text_parts)
+            part = {"type": "summary_text", "text": text}
+            done_item = {
+                "id": reasoning_item_id,
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [part],
+            }
+            await _write_event("response.reasoning_summary_text.done", {
+                "type": "response.reasoning_summary_text.done",
+                "item_id": reasoning_item_id,
+                "output_index": reasoning_output_index,
+                "summary_index": 0,
+                "text": text,
+            })
+            await _write_event("response.reasoning_summary_part.done", {
+                "type": "response.reasoning_summary_part.done",
+                "item_id": reasoning_item_id,
+                "output_index": reasoning_output_index,
+                "summary_index": 0,
+                "part": part,
+            })
+            await _write_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": reasoning_output_index,
+                "item": done_item,
+            })
+            emitted_items.append(done_item)
+            reasoning_item_id = None
+            reasoning_output_index = None
+            reasoning_text_parts.clear()
 
         def _envelope(status: str) -> Dict[str, Any]:
             env: Dict[str, Any] = {
@@ -2967,11 +3043,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Flush batched text before tool events
                     if _batch_buf:
                         await _flush_batch()
-                    if tag == "__tool_started__":
+                    if tag == "__reasoning__":
+                        await _emit_reasoning_delta(payload)
+                    elif tag == "__tool_started__":
+                        await _close_reasoning_item()
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
                 elif isinstance(it, str):
+                    await _close_reasoning_item()
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
                     if _batch_timer is None:
@@ -3041,6 +3121,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Flush any final batched text before processing result
             if _batch_buf:
                 await _flush_batch()
+            await _close_reasoning_item()
 
             # Pick up agent result + usage from the completed task
             try:
@@ -3367,14 +3448,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Queue non-start tool progress events if needed in future.
-
-                The structured Responses stream uses ``tool_start_callback``
-                and ``tool_complete_callback`` for exact call-id correlation,
-                so progress events are currently ignored here.
-                """
-                return
+            def _on_tool_progress(event_type, name=None, preview=None, args=None, **kwargs):
+                """Queue model-visible thinking for Responses reasoning cards."""
+                if event_type == "reasoning.available":
+                    text = preview or ""
+                elif event_type == "_thinking":
+                    text = preview or name or ""
+                else:
+                    return
+                if text:
+                    _stream_q.put(("__reasoning__", str(text)))
 
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Queue a started tool for live function_call streaming."""
