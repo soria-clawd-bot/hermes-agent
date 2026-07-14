@@ -3707,11 +3707,18 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, None
 
         raw_effort = nested.get("effort") if has_nested_effort else body.get("reasoning_effort")
-        from hermes_constants import parse_reasoning_effort
-
-        parsed = parse_reasoning_effort(raw_effort)
-        if parsed is None:
-            param = "reasoning.effort" if has_nested_effort else "reasoning_effort"
+        param = "reasoning.effort" if has_nested_effort else "reasoning_effort"
+        valid_efforts = {
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        }
+        if not isinstance(raw_effort, str) or raw_effort not in valid_efforts:
             return None, web.json_response(
                 _openai_error(
                     "Invalid reasoning effort. Expected one of: none, minimal, low, "
@@ -3720,7 +3727,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
-        return parsed, None
+        if raw_effort == "none":
+            return {"enabled": False}, None
+        return {"enabled": True, "effort": raw_effort}, None
 
     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/responses/{response_id} — delete a stored response."""

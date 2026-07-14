@@ -366,6 +366,41 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
 
+    def test_create_agent_uses_request_reasoning_override(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai-codex",
+                "base_url": "https://example.test/v1",
+                "api_mode": "codex_responses",
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {"enabled": True, "effort": "xhigh"}),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(
+            session_id="api-session",
+            reasoning_config_override={"enabled": True, "effort": "low"},
+        )
+
+        assert isinstance(agent, FakeAgent)
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "low"}
+
     def test_create_agent_refreshes_max_iterations_from_runtime_config(self, monkeypatch):
         captured = {}
 
@@ -2269,6 +2304,154 @@ class TestResponsesEndpoint:
             assert data["output"][0]["content"][0]["text"] != f"provider auth failed OPENAI_API_KEY={raw_secret}"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("request_fields", "expected"),
+        [
+            ({"reasoning": {"effort": "high"}}, {"enabled": True, "effort": "high"}),
+            ({"reasoning_effort": "low"}, {"enabled": True, "effort": "low"}),
+            ({"reasoning_effort": "none"}, {"enabled": False}),
+        ],
+    )
+    async def test_request_reasoning_effort_is_forwarded(self, adapter, request_fields, expected):
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "Hello", **request_fields},
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["reasoning_config_override"] == expected
+
+    @pytest.mark.asyncio
+    async def test_native_reasoning_effort_wins_over_compat_field(self, adapter):
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Hello",
+                        "reasoning": {"effort": "high"},
+                        "reasoning_effort": "low",
+                    },
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["reasoning_config_override"] == {
+            "enabled": True,
+            "effort": "high",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("request_fields", "param"),
+        [
+            ({"reasoning": "high"}, "reasoning"),
+            ({"reasoning": {"effort": "turbo"}}, "reasoning.effort"),
+            ({"reasoning_effort": "turbo"}, "reasoning_effort"),
+            ({"reasoning_effort": False}, "reasoning_effort"),
+            ({"reasoning_effort": None}, "reasoning_effort"),
+            ({"reasoning_effort": ""}, "reasoning_effort"),
+            ({"reasoning_effort": " high "}, "reasoning_effort"),
+            ({"reasoning_effort": "HIGH"}, "reasoning_effort"),
+            ({"reasoning_effort": "false"}, "reasoning_effort"),
+            ({"reasoning_effort": "disabled"}, "reasoning_effort"),
+        ],
+    )
+    async def test_invalid_request_reasoning_effort_returns_400(
+        self, adapter, request_fields, param
+    ):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "Hello", **request_fields},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+
+        assert data["error"]["param"] == param
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_idempotency_fingerprint_includes_reasoning_effort(self, adapter):
+        calls = []
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+
+        async def _mock_run_agent(**kwargs):
+            calls.append(kwargs["reasoning_config_override"])
+            return (
+                mock_result,
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                for effort in ("low", "low", "high"):
+                    resp = await cli.post(
+                        "/v1/responses",
+                        headers={"Idempotency-Key": "reasoning-effort-key"},
+                        json={
+                            "model": "hermes-agent",
+                            "input": "Hello",
+                            "reasoning_effort": effort,
+                        },
+                    )
+                    assert resp.status == 200
+                    await resp.read()
+
+        assert calls == [
+            {"enabled": True, "effort": "low"},
+            {"enabled": True, "effort": "high"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_request_reasoning_override_does_not_leak_to_next_request(self, adapter):
+        seen = []
+
+        def _capture_agent(*, reasoning_config_override=None, **kwargs):
+            seen.append(reasoning_config_override)
+
+            class FakeAgent:
+                session_prompt_tokens = 0
+                session_completion_tokens = 0
+                session_total_tokens = 0
+                session_id = kwargs.get("session_id")
+
+                def run_conversation(self, **_):
+                    return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+            return FakeAgent()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_capture_agent):
+                for request_fields in ({"reasoning_effort": "low"}, {}):
+                    resp = await cli.post(
+                        "/v1/responses",
+                        json={"model": "hermes-agent", "input": "Hello", **request_fields},
+                    )
+                    assert resp.status == 200
+                    await resp.read()
+
+        assert seen == [{"enabled": True, "effort": "low"}, None]
+
+    @pytest.mark.asyncio
     async def test_invalid_input_type_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -2331,10 +2514,18 @@ class TestResponsesStreaming:
                     {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
                 )
 
-            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                patch("gateway.run.GatewayRunner._load_show_reasoning", return_value=True),
+            ):
                 resp = await cli.post(
                     "/v1/responses",
-                    json={"model": "hermes-agent", "input": "inspect it", "stream": True},
+                    json={
+                        "model": "hermes-agent",
+                        "input": "inspect it",
+                        "stream": True,
+                        "reasoning_effort": "high",
+                    },
                 )
 
             assert resp.status == 200
@@ -2379,10 +2570,18 @@ class TestResponsesStreaming:
                     {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
                 )
 
-            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                patch("gateway.run.GatewayRunner._load_show_reasoning", return_value=True),
+            ):
                 resp = await cli.post(
                     "/v1/responses",
-                    json={"model": "hermes-agent", "input": "inspect it", "stream": True},
+                    json={
+                        "model": "hermes-agent",
+                        "input": "inspect it",
+                        "stream": True,
+                        "reasoning_effort": "high",
+                    },
                 )
 
             assert resp.status == 200
