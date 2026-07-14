@@ -3126,7 +3126,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     now = time.monotonic()
                     if now - last_snapshot >= RESPONSES_SSE_SNAPSHOT_SECONDS:
                         snapshot_env = _envelope("in_progress")
-                        snapshot_env["output"] = list(emitted_items)
                         await _write_event("response.in_progress", {
                             "type": "response.in_progress",
                             "response": snapshot_env,
