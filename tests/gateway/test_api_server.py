@@ -2366,6 +2366,40 @@ class TestResponsesStreaming:
             ]
 
     @pytest.mark.asyncio
+    async def test_stream_forwards_provider_reasoning_callback(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                reasoning_cb = kwargs["reasoning_callback"]
+                text_cb = kwargs["stream_delta_callback"]
+                reasoning_cb("Checking live state")
+                text_cb("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "inspect it", "stream": True},
+                )
+
+            assert resp.status == 200
+            body = await resp.text()
+            events = []
+            for block in body.split("\n\n"):
+                data_line = next((line[6:] for line in block.splitlines() if line.startswith("data: ")), None)
+                if data_line and data_line != "[DONE]":
+                    events.append(json.loads(data_line))
+
+            assert [
+                event["delta"]
+                for event in events
+                if event.get("type") == "response.reasoning_summary_text.delta"
+            ] == ["Checking live state"]
+
+    @pytest.mark.asyncio
     async def test_stream_string_false_returns_json_response(self, adapter):
         """Quoted false must not route Responses API requests into SSE mode."""
         mock_result = {
