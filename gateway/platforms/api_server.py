@@ -1271,6 +1271,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        reasoning_config_override: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1291,6 +1292,10 @@ class APIServerAdapter(BasePlatformAdapter):
         routing).  When set — and no session ``/model`` override exists for
         this session — its model/provider/api_key/base_url override the
         global defaults for this agent instance only.
+
+        ``reasoning_config_override`` is a request-local Responses API
+        reasoning setting. It overrides the global config for this agent
+        instance only and never mutates gateway or session state.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -1303,7 +1308,11 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        reasoning_config = GatewayRunner._load_reasoning_config()
+        reasoning_config = (
+            dict(reasoning_config_override)
+            if reasoning_config_override is not None
+            else GatewayRunner._load_reasoning_config()
+        )
         model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
@@ -3351,6 +3360,10 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation = body.get("conversation")
         store = _coerce_request_bool(body.get("store"), default=True)
 
+        reasoning_config_override, reasoning_err = self._parse_responses_reasoning_config(body)
+        if reasoning_err is not None:
+            return reasoning_err
+
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
@@ -3441,7 +3454,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # agent runs so frontends can render text deltas and tool
             # calls in real time.  See _write_sse_responses for details.
             import queue as _q
+            from gateway.run import GatewayRunner
+
             _stream_q: _q.Queue = _q.Queue()
+            expose_reasoning = GatewayRunner._load_show_reasoning()
 
             def _on_delta(delta):
                 # None from the agent is a CLI box-close signal, not EOS.
@@ -3451,11 +3467,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put(delta)
 
             def _on_reasoning_delta(delta):
-                if delta:
+                if expose_reasoning and delta:
                     _stream_q.put(("__reasoning__", str(delta)))
 
             def _on_tool_progress(event_type, name=None, preview=None, args=None, **kwargs):
                 """Queue model-visible thinking for Responses reasoning cards."""
+                if not expose_reasoning:
+                    return
                 if event_type == "reasoning.available":
                     text = preview or ""
                 elif event_type == "_thinking":
@@ -3496,6 +3514,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                reasoning_config_override=reasoning_config_override,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3530,13 +3549,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                reasoning_config_override=reasoning_config_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
             fp = _make_request_fingerprint(
                 body,
-                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
+                keys=[
+                    "input",
+                    "instructions",
+                    "previous_response_id",
+                    "conversation",
+                    "model",
+                    "tools",
+                    "reasoning",
+                    "reasoning_effort",
+                ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
@@ -3630,6 +3659,39 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
         return web.json_response(stored["response"])
+
+    @staticmethod
+    def _parse_responses_reasoning_config(
+        body: Dict[str, Any],
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Parse request-local effort from native and Open WebUI request shapes."""
+        nested = body.get("reasoning")
+        if nested is not None and not isinstance(nested, dict):
+            return None, web.json_response(
+                _openai_error("'reasoning' must be an object", param="reasoning"),
+                status=400,
+            )
+
+        has_nested_effort = isinstance(nested, dict) and "effort" in nested
+        has_compat_effort = "reasoning_effort" in body
+        if not has_nested_effort and not has_compat_effort:
+            return None, None
+
+        raw_effort = nested.get("effort") if has_nested_effort else body.get("reasoning_effort")
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(raw_effort)
+        if parsed is None:
+            param = "reasoning.effort" if has_nested_effort else "reasoning_effort"
+            return None, web.json_response(
+                _openai_error(
+                    "Invalid reasoning effort. Expected one of: none, minimal, low, "
+                    "medium, high, xhigh, max, ultra",
+                    param=param,
+                ),
+                status=400,
+            )
+        return parsed, None
 
     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/responses/{response_id} — delete a stored response."""
@@ -4166,6 +4228,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        reasoning_config_override: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4176,6 +4239,9 @@ class APIServerAdapter(BasePlatformAdapter):
         *route* is an optional ``model_routes`` entry (resolved from the
         request's ``model`` field) that overrides the global model/provider
         for this specific request.
+
+        *reasoning_config_override* is a request-local effort setting passed
+        only to the agent created for this call.
 
         If *agent_ref* is a one-element list, the AIAgent instance is stored
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
@@ -4203,6 +4269,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
+                    reasoning_config_override=reasoning_config_override,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
