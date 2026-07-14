@@ -2369,6 +2369,18 @@ class TestResponsesEndpoint:
             ({"reasoning_effort": "HIGH"}, "reasoning_effort"),
             ({"reasoning_effort": "false"}, "reasoning_effort"),
             ({"reasoning_effort": "disabled"}, "reasoning_effort"),
+            (
+                {"reasoning": {"effort": "high"}, "reasoning_effort": "turbo"},
+                "reasoning_effort",
+            ),
+            (
+                {"reasoning": {"effort": "high"}, "reasoning_effort": False},
+                "reasoning_effort",
+            ),
+            (
+                {"reasoning": {"effort": "turbo"}, "reasoning_effort": "low"},
+                "reasoning.effort",
+            ),
         ],
     )
     async def test_invalid_request_reasoning_effort_returns_400(
@@ -2450,6 +2462,38 @@ class TestResponsesEndpoint:
                     await resp.read()
 
         assert seen == [{"enabled": True, "effort": "low"}, None]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_request_reasoning_overrides_remain_isolated(self, adapter):
+        seen = []
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+
+        async def _mock_run_agent(**kwargs):
+            effort = kwargs["reasoning_config_override"]["effort"]
+            await asyncio.sleep(0.01 if effort == "low" else 0)
+            seen.append(effort)
+            return (
+                mock_result,
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                responses = await asyncio.gather(
+                    cli.post(
+                        "/v1/responses",
+                        json={"model": "hermes-agent", "input": "low", "reasoning_effort": "low"},
+                    ),
+                    cli.post(
+                        "/v1/responses",
+                        json={"model": "hermes-agent", "input": "high", "reasoning_effort": "high"},
+                    ),
+                )
+                assert [response.status for response in responses] == [200, 200]
+                await asyncio.gather(*(response.read() for response in responses))
+
+        assert sorted(seen) == ["high", "low"]
 
     @pytest.mark.asyncio
     async def test_invalid_input_type_returns_400(self, adapter):
@@ -2556,6 +2600,35 @@ class TestResponsesStreaming:
                 "Verifying the result",
             ]
 
+            lifecycle = [
+                event["type"]
+                for event in events
+                if event.get("type", "").startswith("response.reasoning_")
+                or (
+                    event.get("type") in {"response.output_item.added", "response.output_item.done"}
+                    and event.get("item", {}).get("type") == "reasoning"
+                )
+            ]
+            assert lifecycle == [
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+            ]
+
+            get_resp = await cli.get(f"/v1/responses/{completed['id']}")
+            assert get_resp.status == 200
+            stored = await get_resp.json()
+            assert stored["output"] == completed["output"]
+
     @pytest.mark.asyncio
     async def test_stream_forwards_provider_reasoning_callback(self, adapter):
         app = _create_app(adapter)
@@ -2597,6 +2670,85 @@ class TestResponsesStreaming:
                 for event in events
                 if event.get("type") == "response.reasoning_summary_text.delta"
             ] == ["Checking live state"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("reasoning_effort", "show_reasoning"),
+        [("none", True), ("high", False)],
+    )
+    async def test_stream_suppresses_disabled_or_hidden_reasoning(
+        self, adapter, reasoning_effort, show_reasoning
+    ):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                kwargs["reasoning_callback"]("Provider reasoning")
+                kwargs["tool_progress_callback"](
+                    "reasoning.available", "_thinking", "Progress reasoning", None
+                )
+                kwargs["stream_delta_callback"]("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run,
+                patch(
+                    "gateway.run.GatewayRunner._load_show_reasoning",
+                    return_value=show_reasoning,
+                ),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "inspect it",
+                        "stream": True,
+                        "reasoning_effort": reasoning_effort,
+                    },
+                )
+
+            assert resp.status == 200
+            events = []
+            for block in (await resp.text()).split("\n\n"):
+                data_line = next(
+                    (line[6:] for line in block.splitlines() if line.startswith("data: ")),
+                    None,
+                )
+                if data_line and data_line != "[DONE]":
+                    events.append(json.loads(data_line))
+
+            assert not any(
+                event.get("type", "").startswith("response.reasoning_")
+                for event in events
+            )
+            assert not any(
+                event.get("item", {}).get("type") == "reasoning"
+                for event in events
+            )
+            completed = next(
+                event["response"]
+                for event in events
+                if event.get("type") == "response.completed"
+            )
+            assert not any(item.get("type") == "reasoning" for item in completed["output"])
+
+            stored_resp = await cli.get(f"/v1/responses/{completed['id']}")
+            assert stored_resp.status == 200
+            stored = await stored_resp.json()
+            assert stored["output"] == completed["output"]
+            assert not any(item.get("type") == "reasoning" for item in stored["output"])
+
+            expected_override = (
+                {"enabled": False}
+                if reasoning_effort == "none"
+                else {"enabled": True, "effort": "high"}
+            )
+            assert (
+                mock_run.call_args.kwargs["reasoning_config_override"]
+                == expected_override
+            )
 
     @pytest.mark.asyncio
     async def test_stream_string_false_returns_json_response(self, adapter):

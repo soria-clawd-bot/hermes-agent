@@ -3482,9 +3482,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 if reasoning_config_override is not None
                 else GatewayRunner._load_reasoning_config()
             )
-            expose_reasoning = (
-                GatewayRunner._load_show_reasoning()
-                and effective_reasoning.get("effort") != "none"
+            reasoning_enabled = (
+                effective_reasoning is None
+                or effective_reasoning.get("enabled", True)
+            )
+            expose_reasoning = bool(
+                GatewayRunner._load_show_reasoning() and reasoning_enabled
             )
 
             def _on_delta(delta):
@@ -3706,8 +3709,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if not has_nested_effort and not has_compat_effort:
             return None, None
 
-        raw_effort = nested.get("effort") if has_nested_effort else body.get("reasoning_effort")
-        param = "reasoning.effort" if has_nested_effort else "reasoning_effort"
         valid_efforts = {
             "none",
             "minimal",
@@ -3718,15 +3719,23 @@ class APIServerAdapter(BasePlatformAdapter):
             "max",
             "ultra",
         }
-        if not isinstance(raw_effort, str) or raw_effort not in valid_efforts:
-            return None, web.json_response(
-                _openai_error(
-                    "Invalid reasoning effort. Expected one of: none, minimal, low, "
-                    "medium, high, xhigh, max, ultra",
-                    param=param,
-                ),
-                status=400,
-            )
+        supplied_efforts = []
+        if has_nested_effort:
+            supplied_efforts.append(("reasoning.effort", nested.get("effort")))
+        if has_compat_effort:
+            supplied_efforts.append(("reasoning_effort", body.get("reasoning_effort")))
+        for param, supplied_effort in supplied_efforts:
+            if not isinstance(supplied_effort, str) or supplied_effort not in valid_efforts:
+                return None, web.json_response(
+                    _openai_error(
+                        "Invalid reasoning effort. Expected one of: none, minimal, low, "
+                        "medium, high, xhigh, max, ultra",
+                        param=param,
+                    ),
+                    status=400,
+                )
+
+        raw_effort = nested.get("effort") if has_nested_effort else body.get("reasoning_effort")
         if raw_effort == "none":
             return {"enabled": False}, None
         return {"enabled": True, "effort": raw_effort}, None
