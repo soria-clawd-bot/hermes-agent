@@ -31,6 +31,10 @@ from typing import List, Dict, Any, Set, Optional
 _HERMES_CORE_TOOLS = [
     # Web
     "web_search", "web_extract",
+    # Soria's primary research provider. Keep its single ask schema visible so
+    # explicit Perplexity requests do not spend two model rounds discovering
+    # and describing the tool before the actual research call.
+    "mcp__perplexity__perplexity_ask",
     # Terminal + process management
     "terminal", "process",
     # Read the desktop GUI's embedded terminal pane, and close an agent's

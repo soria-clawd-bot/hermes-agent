@@ -2665,6 +2665,7 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        expose_reasoning: bool = False,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -2746,33 +2747,39 @@ class APIServerAdapter(BasePlatformAdapter):
             payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
             await response.write(payload.encode())
 
+        async def _open_reasoning_item() -> None:
+            """Open a visible Thought card before the first provider token arrives."""
+            nonlocal reasoning_item_id, reasoning_output_index, output_index
+            if reasoning_item_id is not None:
+                return
+            reasoning_item_id = f"rs_{uuid.uuid4().hex[:24]}"
+            reasoning_output_index = output_index
+            output_index += 1
+            reasoning_text_parts.clear()
+            await _write_event("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": reasoning_output_index,
+                "item": {
+                    "id": reasoning_item_id,
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                },
+            })
+            await _write_event("response.reasoning_summary_part.added", {
+                "type": "response.reasoning_summary_part.added",
+                "item_id": reasoning_item_id,
+                "output_index": reasoning_output_index,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": "Thinking…\n\n"},
+            })
+
         async def _emit_reasoning_delta(delta_text: str) -> None:
             """Stream one Hermes thinking segment as a Responses reasoning summary."""
-            nonlocal reasoning_item_id, reasoning_output_index, output_index
             if not delta_text:
                 return
             if reasoning_item_id is None:
-                reasoning_item_id = f"rs_{uuid.uuid4().hex[:24]}"
-                reasoning_output_index = output_index
-                output_index += 1
-                reasoning_text_parts.clear()
-                await _write_event("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": reasoning_output_index,
-                    "item": {
-                        "id": reasoning_item_id,
-                        "type": "reasoning",
-                        "status": "in_progress",
-                        "summary": [],
-                    },
-                })
-                await _write_event("response.reasoning_summary_part.added", {
-                    "type": "response.reasoning_summary_part.added",
-                    "item_id": reasoning_item_id,
-                    "output_index": reasoning_output_index,
-                    "summary_index": 0,
-                    "part": {"type": "summary_text", "text": ""},
-                })
+                await _open_reasoning_item()
             reasoning_text_parts.append(delta_text)
             await _write_event("response.reasoning_summary_text.delta", {
                 "type": "response.reasoning_summary_text.delta",
@@ -2787,7 +2794,7 @@ class APIServerAdapter(BasePlatformAdapter):
             nonlocal reasoning_item_id, reasoning_output_index
             if reasoning_item_id is None or reasoning_output_index is None:
                 return
-            text = "".join(reasoning_text_parts)
+            text = "".join(reasoning_text_parts) or "Thinking…"
             part = {"type": "summary_text", "text": text}
             done_item = {
                 "id": reasoning_item_id,
@@ -2896,6 +2903,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "response": created_env,
             })
             _persist_response_snapshot(created_env)
+            if expose_reasoning:
+                await _open_reasoning_item()
             last_activity = time.monotonic()
 
             async def _open_message_item() -> None:
@@ -3457,7 +3466,15 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.run import GatewayRunner
 
             _stream_q: _q.Queue = _q.Queue()
-            expose_reasoning = GatewayRunner._load_show_reasoning()
+            effective_reasoning = (
+                reasoning_config_override
+                if reasoning_config_override is not None
+                else GatewayRunner._load_reasoning_config()
+            )
+            expose_reasoning = (
+                GatewayRunner._load_show_reasoning()
+                and effective_reasoning.get("effort") != "none"
+            )
 
             def _on_delta(delta):
                 # None from the agent is a CLI box-close signal, not EOS.
@@ -3539,6 +3556,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                expose_reasoning=expose_reasoning,
             )
 
         async def _compute_response():
