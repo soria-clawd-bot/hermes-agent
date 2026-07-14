@@ -389,6 +389,12 @@ X-Hermes-Session-Key: agent:main:webui:dm:user-42
 
 Rules: max 256 chars, control characters (`\r`, `\n`, `\x00`) are rejected, and the value is echoed back on responses (JSON + SSE). `/v1/capabilities` advertises support via `"session_key_header": "X-Hermes-Session-Key"`. Without the key, Honcho's `per-session` strategy produces a different scope per `session_id` — exactly the behavior Hermes had before.
 
+## Open WebUI session provenance
+
+Open WebUI can attach `X-OpenWebUI-Chat-Id` and `X-OpenWebUI-Message-Id` to primary chat requests. Hermes stores those values in `state.db` without forwarding user identity. The message header is optional; if present, the chat header is required. Values are limited to 256 characters and reject control characters.
+
+Use `session_search(openwebui_chat_id="...")` to return every linked Hermes execution newest first and `latest_session_id`. Add `openwebui_message_id` to resolve one exact assistant turn. Open WebUI must enable `ENABLE_FORWARD_SESSION_INFO_HEADERS=true`; auxiliary title, tag, and follow-up tasks do not forward provenance headers.
+
 ## System Prompt Handling
 
 When a frontend sends a `system` message (Chat Completions) or `instructions` field (Responses API), hermes-agent **layers it on top** of its core system prompt. Your agent keeps all its tools, memory, and skills — the frontend's system prompt adds extra instructions.

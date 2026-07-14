@@ -75,6 +75,8 @@ class TestSchema:
         assert "window" in params
         # Shared
         assert "role_filter" in params
+        assert "openwebui_chat_id" in params
+        assert "openwebui_message_id" in params
 
     def test_no_mode_parameter(self):
         # Mode is inferred from which args are set — no explicit mode param
@@ -570,6 +572,61 @@ class TestCrossProfileRead:
             assert result["success"] is True, kwargs
             assert result["mode"] == "read"
             assert result["session_id"] == "s_other"
+
+
+# =========================================================================
+# OpenWebUI provenance lookup
+# =========================================================================
+
+class TestOpenWebUILookup:
+    def test_chat_returns_distinct_sessions_newest_first(self, db):
+        db.create_session("s_first", source="api_server")
+        db.create_session("s_latest", source="api_server")
+        db.record_session_origin(
+            "s_first", platform="open_webui", chat_id="chat-1", message_id="msg-1"
+        )
+        db._conn.execute(
+            "UPDATE session_origins SET created_at = created_at - 10 WHERE session_id = ?",
+            ("s_first",),
+        )
+        db.record_session_origin(
+            "s_latest", platform="open_webui", chat_id="chat-1", message_id="msg-2"
+        )
+        db.record_session_origin(
+            "s_latest", platform="open_webui", chat_id="chat-1", message_id="msg-3"
+        )
+        db._conn.commit()
+
+        result = json.loads(session_search(openwebui_chat_id="chat-1", db=db))
+
+        assert result["success"] is True
+        assert result["mode"] == "openwebui_lookup"
+        assert result["latest_session_id"] == "s_latest"
+        assert result["truncated"] is False
+        assert [row["session_id"] for row in result["results"]] == [
+            "s_latest",
+            "s_first",
+        ]
+        assert result["results"][0]["openwebui_message_id"] == "msg-3"
+
+    def test_message_id_narrows_to_exact_execution(self, db):
+        for sid, message_id in (("s_one", "msg-1"), ("s_two", "msg-2")):
+            db.create_session(sid, source="api_server")
+            db.record_session_origin(
+                sid,
+                platform="open_webui",
+                chat_id="chat-1",
+                message_id=message_id,
+            )
+
+        result = json.loads(session_search(
+            openwebui_chat_id="chat-1",
+            openwebui_message_id="msg-1",
+            db=db,
+        ))
+
+        assert result["count"] == 1
+        assert result["latest_session_id"] == "s_one"
 
 
 # =========================================================================

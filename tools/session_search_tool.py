@@ -616,6 +616,47 @@ def _discover(
     }, ensure_ascii=False)
 
 
+def _lookup_openwebui_sessions(db, *, chat_id: str, message_id: str = "") -> str:
+    """Resolve durable OpenWebUI provenance to Hermes execution sessions."""
+    if not str(chat_id or "").strip():
+        return tool_error("openwebui_chat_id is required", success=False)
+    try:
+        rows = db.find_sessions_by_origin(
+            platform="open_webui",
+            chat_id=chat_id,
+            message_id=message_id,
+            limit=101,
+        )
+    except Exception as exc:
+        logging.error("OpenWebUI session lookup failed: %s", exc, exc_info=True)
+        return tool_error(f"OpenWebUI session lookup failed: {exc}", success=False)
+
+    truncated = len(rows) > 100
+    rows = rows[:100]
+    results = [
+        {
+            "session_id": row.get("id"),
+            "openwebui_message_id": row.get("origin_message_id") or None,
+            "when": _format_timestamp(row.get("started_at")),
+            "source": row.get("source"),
+            "model": row.get("model"),
+            "title": row.get("title"),
+            "message_count": row.get("message_count", 0),
+        }
+        for row in rows
+    ]
+    return json.dumps({
+        "success": True,
+        "mode": "openwebui_lookup",
+        "openwebui_chat_id": chat_id,
+        "openwebui_message_id": message_id or None,
+        "latest_session_id": results[0]["session_id"] if results else None,
+        "count": len(results),
+        "truncated": truncated,
+        "results": results,
+    }, ensure_ascii=False)
+
+
 def session_search(
     query: str = "",
     role_filter: str = None,
@@ -630,6 +671,9 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    # OpenWebUI provenance lookup
+    openwebui_chat_id: str = None,
+    openwebui_message_id: str = None,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -674,6 +718,14 @@ def session_search(
         if profile_db is not None:
             db = profile_db
             current_session_id = None
+
+    # OpenWebUI lookup takes precedence over transcript search/read shapes.
+    if openwebui_chat_id or openwebui_message_id:
+        return _lookup_openwebui_sessions(
+            db,
+            chat_id=openwebui_chat_id or "",
+            message_id=openwebui_message_id or "",
+        )
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
@@ -766,7 +818,7 @@ SESSION_SEARCH_SCHEMA = {
         "and why before falling back to session history. Do not conclude 'not found' "
         "or 'no prior correspondence' from session_search alone when a direct source "
         "was provided.\n\n"
-        "FOUR CALLING SHAPES\n\n"
+        "FIVE CALLING SHAPES\n\n"
         "  1) DISCOVERY — pass `query`:\n"
         "     session_search(query=\"auth refactor\", limit=3)\n"
         "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
@@ -802,6 +854,10 @@ SESSION_SEARCH_SCHEMA = {
         "     session_search()\n"
         "     Returns recent sessions chronologically: titles, previews, timestamps. "
         "Use when the user asks \"what was I working on\" without naming a topic.\n\n"
+        "  5) OPENWEBUI LOOKUP — pass `openwebui_chat_id` and optionally "
+        "`openwebui_message_id`:\n"
+        "     Returns all durably linked Hermes execution sessions newest first, "
+        "plus latest_session_id. Message ID narrows the lookup to one assistant turn.\n\n"
         "FTS5 SYNTAX\n\n"
         "  AND is the default — multi-word queries require all terms. Use OR explicitly "
         "for broader recall (`alpha OR beta OR gamma`), quoted phrases for exact match "
@@ -891,6 +947,20 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "openwebui_chat_id": {
+                "type": "string",
+                "description": (
+                    "OpenWebUI chat UUID. Returns every durably linked Hermes execution "
+                    "newest first, plus latest_session_id."
+                ),
+            },
+            "openwebui_message_id": {
+                "type": "string",
+                "description": (
+                    "Optional OpenWebUI assistant-message UUID used with "
+                    "openwebui_chat_id to resolve one exact execution."
+                ),
+            },
         },
         "required": [],
     },
@@ -913,6 +983,8 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         profile=args.get("profile"),
+        openwebui_chat_id=args.get("openwebui_chat_id"),
+        openwebui_message_id=args.get("openwebui_message_id"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
     ),

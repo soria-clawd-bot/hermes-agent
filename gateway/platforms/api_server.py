@@ -1219,6 +1219,61 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _parse_openwebui_origin_headers(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional[str], Optional["web.Response"]]:
+        """Validate optional OpenWebUI chat/message provenance headers."""
+        chat_id = request.headers.get("X-OpenWebUI-Chat-Id", "").strip()
+        message_id = request.headers.get("X-OpenWebUI-Message-Id", "").strip()
+        if not chat_id and not message_id:
+            return None, None, None
+        if not chat_id:
+            return None, None, web.json_response(
+                _openai_error(
+                    "X-OpenWebUI-Chat-Id is required when forwarding OpenWebUI session provenance",
+                    param="X-OpenWebUI-Chat-Id",
+                ),
+                status=400,
+            )
+        for name, value in (
+            ("X-OpenWebUI-Chat-Id", chat_id),
+            ("X-OpenWebUI-Message-Id", message_id),
+        ):
+            if re.search(r'[\r\n\x00]', value) or len(value) > self._MAX_SESSION_HEADER_LEN:
+                return None, None, web.json_response(
+                    _openai_error(f"Invalid {name}", param=name),
+                    status=400,
+                )
+        return chat_id, message_id or None, None
+
+    def _record_openwebui_origin(
+        self,
+        *,
+        session_id: str,
+        chat_id: Optional[str],
+        message_id: Optional[str],
+    ) -> None:
+        if not chat_id:
+            return
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return
+            db.create_session(
+                session_id,
+                source="api_server",
+                chat_id=chat_id,
+                chat_type="open_webui",
+            )
+            db.record_session_origin(
+                session_id,
+                platform="open_webui",
+                chat_id=chat_id,
+                message_id=message_id or "",
+            )
+        except Exception as exc:
+            logger.warning("Could not persist OpenWebUI session provenance: %s", exc)
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -2271,6 +2326,11 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        openwebui_chat_id, openwebui_message_id, origin_error = (
+            self._parse_openwebui_origin_headers(request)
+        )
+        if origin_error is not None:
+            return origin_error
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -2330,6 +2390,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+
+        self._record_openwebui_origin(
+            session_id=session_id,
+            chat_id=openwebui_chat_id,
+            message_id=openwebui_message_id,
+        )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -3486,6 +3552,11 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        openwebui_chat_id, openwebui_message_id, origin_error = (
+            self._parse_openwebui_origin_headers(request)
+        )
+        if origin_error is not None:
+            return origin_error
         render_profile, render_profile_err = self._parse_render_profile_header(request)
         if render_profile_err is not None:
             return render_profile_err
@@ -3594,6 +3665,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
+        self._record_openwebui_origin(
+            session_id=session_id,
+            chat_id=openwebui_chat_id,
+            message_id=openwebui_message_id,
+        )
 
         # Per-client model routing for /v1/responses (see model_routes).
         route = self._resolve_route(body.get("model"))

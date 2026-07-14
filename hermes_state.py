@@ -763,6 +763,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
+CREATE TABLE IF NOT EXISTS session_origins (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    message_id TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    PRIMARY KEY (session_id, platform, chat_id, message_id)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -831,6 +840,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_session_origins_chat
+    ON session_origins(platform, chat_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_session_origins_message
+    ON session_origins(platform, message_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
@@ -2832,6 +2845,87 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def record_session_origin(
+        self,
+        session_id: str,
+        *,
+        platform: str,
+        chat_id: str,
+        message_id: str = "",
+    ) -> None:
+        """Associate an external client chat/message with a Hermes session."""
+        platform = str(platform or "").strip()
+        chat_id = str(chat_id or "").strip()
+        message_id = str(message_id or "").strip()
+        if not session_id or not platform or not chat_id:
+            raise ValueError("session_id, platform, and chat_id are required")
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO session_origins
+                    (session_id, platform, chat_id, message_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, platform, chat_id, message_id)
+                DO UPDATE SET created_at = excluded.created_at
+                """,
+                (session_id, platform, chat_id, message_id, time.time()),
+            )
+
+        self._execute_write(_do)
+
+    def find_sessions_by_origin(
+        self,
+        *,
+        platform: str,
+        chat_id: str = "",
+        message_id: str = "",
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return newest distinct Hermes sessions linked to an external origin."""
+        platform = str(platform or "").strip()
+        chat_id = str(chat_id or "").strip()
+        message_id = str(message_id or "").strip()
+        if not platform or not (chat_id or message_id):
+            raise ValueError("platform and either chat_id or message_id are required")
+        limit = max(1, min(int(limit), 1000))
+
+        clauses = ["o.platform = ?"]
+        params: List[Any] = [platform]
+        if chat_id:
+            clauses.append("o.chat_id = ?")
+            params.append(chat_id)
+        if message_id:
+            clauses.append("o.message_id = ?")
+            params.append(message_id)
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                WITH ranked_origins AS (
+                    SELECT o.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY o.session_id
+                               ORDER BY o.created_at DESC
+                           ) AS origin_rank
+                    FROM session_origins o
+                    WHERE {' AND '.join(clauses)}
+                )
+                SELECT s.*, o.platform AS origin_platform,
+                       o.chat_id AS origin_chat_id,
+                       o.message_id AS origin_message_id,
+                       o.created_at AS origin_created_at
+                FROM ranked_origins o
+                JOIN sessions s ON s.id = o.session_id
+                WHERE o.origin_rank = 1
+                ORDER BY o.created_at DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.

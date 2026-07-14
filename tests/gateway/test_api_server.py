@@ -1913,6 +1913,54 @@ class TestResponsesEndpoint:
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
 
     @pytest.mark.asyncio
+    async def test_openwebui_headers_persist_session_provenance(self, adapter, tmp_path):
+        from hermes_state import SessionDB
+
+        adapter._session_db = SessionDB(tmp_path / "state.db")
+        mock_result = {"final_response": "Done", "messages": [], "api_calls": 1}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={
+                        "X-OpenWebUI-Chat-Id": "chat-123",
+                        "X-OpenWebUI-Message-Id": "message-456",
+                    },
+                    json={"model": "hermes-agent", "input": "Hello"},
+                )
+
+        assert resp.status == 200
+        hermes_session_id = resp.headers["X-Hermes-Session-Id"]
+        rows = adapter._session_db.find_sessions_by_origin(
+            platform="open_webui",
+            chat_id="chat-123",
+            message_id="message-456",
+        )
+        assert [row["id"] for row in rows] == [hermes_session_id]
+        assert rows[0]["chat_type"] == "open_webui"
+
+    @pytest.mark.asyncio
+    async def test_openwebui_message_header_requires_chat_header(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"X-OpenWebUI-Message-Id": "message-456"},
+                    json={"model": "hermes-agent", "input": "Hello"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert mock_run.await_count == 0
+        assert data["error"]["param"] == "X-OpenWebUI-Chat-Id"
+
+    @pytest.mark.asyncio
     async def test_successful_response_with_array_input(self, adapter):
         """Array input with role/content objects."""
         mock_result = {"final_response": "Done", "messages": [], "api_calls": 1}
