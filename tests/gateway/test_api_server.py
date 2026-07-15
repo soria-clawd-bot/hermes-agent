@@ -1996,6 +1996,8 @@ class TestResponsesEndpoint:
             assert "Be accurate." in prompt
             assert prompt.count("[Hermes client render profile: open-webui-v1]") == 1
             assert "Write the final answer exactly once" in prompt
+            assert "MEDIA:/absolute/path/to/image" in prompt
+            assert "PNG, JPEG, GIF, or WebP" in prompt
 
     @pytest.mark.asyncio
     async def test_unknown_render_profile_is_rejected(self, adapter):

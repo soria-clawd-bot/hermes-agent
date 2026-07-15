@@ -114,6 +114,10 @@ _RENDER_PROFILE_PROMPTS = {
         "[Hermes client render profile: open-webui-v1]\n"
         "Write the final answer exactly once. Keep it concise and self-contained. "
         "Use Markdown headings and lists only when they materially improve readability. "
+        "When the user asks for an image that you created or can access on this host, and "
+        "the image is a PNG, JPEG, GIF, or WebP under an approved local-media directory, "
+        "include MEDIA:/absolute/path/to/image on its own line so Open WebUI renders it "
+        "inline. Do not replace the local path with a fabricated public URL. "
         "Do not repeat the final answer in a progress update. During tool work, report only "
         "material milestones or blockers instead of narrating each routine tool call."
     ),
