@@ -1731,6 +1731,37 @@ class TestTaskCompletionGuidance:
             assert TASK_COMPLETION_GUIDANCE not in a._build_system_prompt()
 
 
+class TestHostRuntimeSafetyGuidance:
+    @pytest.mark.parametrize(
+        "model",
+        ("google/gemini-3.5-flash", "openai/gpt-5.4"),
+    )
+    def test_injects_for_tool_using_agents_that_skip_context_files(self, model):
+        from agent.prompt_builder import HOST_RUNTIME_SAFETY_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("hermes_cli.config.load_config", return_value={}),
+        ):
+            agent = AIAgent(
+                model=model,
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent.client = MagicMock()
+
+        prompt = agent._build_system_prompt()
+        assert prompt.count(HOST_RUNTIME_SAFETY_GUIDANCE) == 1
+
+
 class TestEnvironmentProbeIntegration:
     """Tests for the local Python toolchain probe wiring (config.yaml
     ``agent.environment_probe``).  The probe itself is unit-tested in
