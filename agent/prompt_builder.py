@@ -356,6 +356,17 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Universal shared-host safety guidance. Kept short because it is included in
+# every tool-using agent's cached system prompt, including delegated and
+# workflow children that intentionally skip cwd context files.
+HOST_RUNTIME_SAFETY_GUIDANCE = (
+    "# Host runtime safety\n"
+    "Treat existing processes and services on a shared host as owned state. "
+    "Do not stop, restart, or kill them unless the task explicitly requires it. "
+    "Never use broad or user-session-wide termination. Identify the exact PID, "
+    "process group, or service unit first, and ask when the scope is unclear."
+)
+
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
 # Why this matters for cost: every assistant turn resends the entire
