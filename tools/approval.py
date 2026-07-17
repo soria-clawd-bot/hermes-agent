@@ -443,6 +443,19 @@ HARDLINE_PATTERNS = [
     (r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:', "fork bomb"),
     # Kill every process on the system
     (r'\bkill\s+(-[^\s]+\s+)*-1\b', "kill all processes"),
+    # User-manager/session termination takes down every user service and agent.
+    (_CMDPOS + r'systemctl\s+(?:-[^\s]+\s+)*exit\b', "terminate systemd user manager"),
+    (_CMDPOS + r'loginctl\s+(?:-[^\s]+\s+)*terminate-user\b', "terminate user session"),
+    # A negative PID without the explicit `--` delimiter is ambiguous to kill
+    # implementations and can degrade into kill(-1). Correct, inspected process-
+    # group targeting remains available as `kill -TERM -- -<PGID>`.
+    (
+        _CMDPOS
+        + r'kill\s+(?![^\n]*\s--\s)(?:-[^\s]+\s+)*-'
+        + r'(?:["\']?\$(?:\{?[a-z_][a-z0-9_]*\}?|[0-9]+)["\']?|\d+)'
+        + r'(?=[\s;&|]|$)',
+        "ambiguous negative process target (use -- -PGID)",
+    ),
     # System shutdown / reboot — anchor to command position (start of line,
     # after a command separator, or after sudo/env wrappers) so we don't
     # false-positive on "echo reboot" or "grep 'shutdown' logs".
