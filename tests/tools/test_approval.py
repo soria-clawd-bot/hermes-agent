@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch as mock_patch
 
+import pytest
 import tools.approval as approval_module
 from hermes_constants import get_hermes_home
 from tools.approval import (
@@ -1155,6 +1156,35 @@ class TestForkBombDetection:
     def test_colon_in_safe_command_not_flagged(self):
         dangerous, key, desc = detect_dangerous_command("echo hello:world")
         assert dangerous is False
+
+
+class TestHostSessionTerminationHardline:
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "systemctl --user exit",
+            "loginctl terminate-user openclaw",
+            "kill -TERM -$pid",
+            'kill -TERM -"$pid"',
+            "sudo kill -TERM -1330",
+        ),
+    )
+    def test_session_wide_termination_is_hardline_blocked(self, command):
+        is_hardline, description = detect_hardline_command(command)
+        assert is_hardline is True, command
+        assert description is not None
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            "systemctl --user status",
+            "loginctl show-user openclaw",
+            "kill -TERM 1330",
+            "kill -TERM -- -1330",
+        ),
+    )
+    def test_narrow_or_explicit_process_target_is_not_hardline(self, command):
+        assert detect_hardline_command(command) == (False, None)
 
 
 class TestGatewayProtection:

@@ -27,6 +27,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    HOST_RUNTIME_SAFETY_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
@@ -1616,6 +1617,15 @@ class TestOpenAIModelExecutionGuidance:
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
 
 
+class TestHostRuntimeSafetyGuidance:
+    def test_guidance_is_short_and_specific(self):
+        text = HOST_RUNTIME_SAFETY_GUIDANCE.lower()
+        assert "shared host" in text
+        assert "user-session-wide" in text
+        assert "exact pid" in text
+        assert len(HOST_RUNTIME_SAFETY_GUIDANCE) < 600
+
+
 class TestParallelToolCallGuidance:
     """Behavior contracts for the universal parallel-tool-call guidance block.
 
@@ -1662,5 +1672,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
