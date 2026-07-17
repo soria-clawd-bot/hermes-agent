@@ -35,6 +35,7 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     EXECUTION_GUIDANCE_MODELS,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    HOST_RUNTIME_SAFETY_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
     KANBAN_GUIDANCE,
@@ -496,6 +497,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
     _help_guidance_slot = len(stable_parts)
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+
+    # Universal shared-host safety. This must not depend on model family or cwd
+    # context files: workflow/delegated children commonly skip AGENTS.md.
+    if agent.valid_tool_names:
+        stable_parts.append(HOST_RUNTIME_SAFETY_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
