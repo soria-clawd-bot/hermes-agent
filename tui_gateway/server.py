@@ -10552,6 +10552,17 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     index,
                 ):
                     break
+                from tools.async_delegation import (
+                    claim_event_delivery,
+                    complete_event_delivery,
+                    release_event_delivery,
+                )
+
+                _claim = claim_event_delivery(_evt, "tui-post-turn")
+                if _claim is None:
+                    with session["history_lock"]:
+                        session["running"] = False
+                    continue
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
