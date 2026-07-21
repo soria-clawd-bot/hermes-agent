@@ -1309,10 +1309,9 @@ class ProcessRegistry:
           callers). Non-matching addressed events are re-queued.
 
         With neither set, all events are consumed (legacy single-session
-        behavior, backward compatible). Ownerless ordinary notifications also
-        retain that legacy behavior even when a filter is provided. When a
-        filter is provided, ownerless async-delegation events remain
-        fail-closed and require positive proof.
+        behavior, backward compatible). Once an ownership callback is supplied,
+        every notification requires positive proof, including legacy ownerless
+        process events.
         """
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []

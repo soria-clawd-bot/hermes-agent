@@ -1305,7 +1305,7 @@ def test_drain_notifications_session_key_filter_requeues_origin_only_event(regis
     assert registry.completion_queue.empty()
 
 
-def test_drain_notifications_ownerless_completion_preserves_legacy_delivery(registry):
+def test_drain_notifications_ownerless_completion_requires_callback_ownership(registry):
     event = {
         "type": "completion",
         "session_id": "proc_ownerless",
@@ -1320,7 +1320,8 @@ def test_drain_notifications_ownerless_completion_preserves_legacy_delivery(regi
         owns_event=lambda _event: False,
     )
 
-    assert [raw for raw, _ in results] == [event]
+    assert results == []
+    assert registry.completion_queue.get_nowait() == event
     assert registry.completion_queue.empty()
 
 
