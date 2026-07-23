@@ -3394,7 +3394,7 @@ class SlackAdapter(BasePlatformAdapter):
     # ----- Markdown → mrkdwn conversion -----
 
     @staticmethod
-    def _is_block_payload_rejection(error: BaseException) -> bool:
+    def _is_block_payload_rejection(error: Any) -> bool:
         """Return True for Slack errors recoverable by removing ``blocks``.
 
         Rich Block Kit output is a progressive enhancement over the plain
@@ -3407,6 +3407,13 @@ class SlackAdapter(BasePlatformAdapter):
             "msg_too_long",
             "too_many_blocks",
         }
+        error_get = getattr(error, "get", None)
+        if callable(error_get):
+            try:
+                if error_get("error") in recoverable_codes:
+                    return True
+            except Exception:
+                pass
         response = getattr(error, "response", None)
         response_get = getattr(response, "get", None)
         if callable(response_get):
@@ -8655,11 +8662,13 @@ async def _standalone_send(
     media_files = media_files or []
     warnings: List[str] = []
 
+    _fmt_adapter = SlackAdapter.__new__(SlackAdapter)
+    _fmt_adapter.config = pconfig
+
     def _format_mrkdwn(text: str) -> str:
         if not text:
             return text
         try:
-            _fmt_adapter = SlackAdapter.__new__(SlackAdapter)
             return _fmt_adapter.format_message(text)
         except Exception:
             logger.debug(
@@ -8668,8 +8677,43 @@ async def _standalone_send(
             )
             return text
 
+    def _render_blocks(text: str) -> Optional[list]:
+        if not text:
+            return None
+        try:
+            return _fmt_adapter._maybe_blocks(text)
+        except Exception:
+            logger.debug(
+                "Failed to render Slack blocks in _standalone_send",
+                exc_info=True,
+            )
+            return None
+
+    async def _chat_post_with_block_fallback(client, kwargs: Dict[str, Any]):
+        """Post once with blocks, retrying plain text on block rejection."""
+        try:
+            response = await client.chat_postMessage(**kwargs)
+        except Exception as exc:
+            if kwargs.get("blocks") and SlackAdapter._is_block_payload_rejection(exc):
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs.pop("blocks", None)
+                return await client.chat_postMessage(**fallback_kwargs)
+            raise
+        if (
+            isinstance(response, dict)
+            and not response.get("ok", True)
+            and kwargs.get("blocks")
+            and SlackAdapter._is_block_payload_rejection(response)
+        ):
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs.pop("blocks", None)
+            return await client.chat_postMessage(**fallback_kwargs)
+        return response
+
     formatted = _format_mrkdwn(message) if message else message
     formatted_caption = _format_mrkdwn(caption) if caption else caption
+    message_blocks = _render_blocks(message)
+    caption_blocks = _render_blocks(caption)
 
     # --- Media path: AsyncWebClient.files_upload_v2 (+ optional text) ---
     if media_files:
@@ -8698,10 +8742,12 @@ async def _standalone_send(
                 "text": text_to_send,
                 "mrkdwn": True,
             }
+            if message_blocks:
+                post_kwargs["blocks"] = message_blocks
             if thread_id:
                 post_kwargs["thread_ts"] = thread_id
             try:
-                post_resp = await client.chat_postMessage(**post_kwargs)
+                post_resp = await _chat_post_with_block_fallback(client, post_kwargs)
                 if isinstance(post_resp, dict) and not post_resp.get("ok", True):
                     return {
                         "error": f"Slack API error: {post_resp.get('error', 'unknown')}"
@@ -8727,9 +8773,13 @@ async def _standalone_send(
                             "text": formatted_caption,
                             "mrkdwn": True,
                         }
+                        if caption_blocks:
+                            fallback_kwargs["blocks"] = caption_blocks
                         if thread_id:
                             fallback_kwargs["thread_ts"] = thread_id
-                        fb = await client.chat_postMessage(**fallback_kwargs)
+                        fb = await _chat_post_with_block_fallback(
+                            client, fallback_kwargs
+                        )
                         if isinstance(fb, dict) and fb.get("ok", True):
                             last_message_id = fb.get("ts") or last_message_id
                             caption_pending = False
@@ -8811,6 +8861,8 @@ async def _standalone_send(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw
         ) as session:
             payload = {"channel": chat_id, "text": formatted, "mrkdwn": True}
+            if message_blocks:
+                payload["blocks"] = message_blocks
             if thread_id:
                 payload["thread_ts"] = thread_id
             for tok in tokens:
@@ -8822,6 +8874,20 @@ async def _standalone_send(
                     url, headers=headers, json=payload, **_req_kw
                 ) as resp:
                     data = await resp.json()
+                if (
+                    not data.get("ok")
+                    and payload.get("blocks")
+                    and SlackAdapter._is_block_payload_rejection(data)
+                ):
+                    fallback_payload = dict(payload)
+                    fallback_payload.pop("blocks", None)
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        json=fallback_payload,
+                        **_req_kw,
+                    ) as resp:
+                        data = await resp.json()
                 if data.get("ok"):
                     return {
                         "success": True,

@@ -161,3 +161,58 @@ def test_standalone_send_stops_on_non_token_error(monkeypatch, _standalone_send)
 
     assert result == {"error": "Slack API error: msg_too_long"}
     assert len(fake_session.calls) == 1
+
+
+def test_standalone_send_uses_rich_blocks_with_text_fallback(
+    monkeypatch, _standalone_send
+):
+    fake_session = _SlackSession()
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda *args, **kwargs: fake_session
+    )
+
+    pconfig = SimpleNamespace(
+        enabled=True,
+        token="good-token",
+        extra={"rich_blocks": True},
+    )
+    result = asyncio.run(
+        _standalone_send(pconfig, "C123", "# Daily update\n\n- one\n- two")
+    )
+
+    assert result["success"] is True
+    payload = fake_session.calls[0][1]
+    assert payload["text"] == "*Daily update*\n\n- one\n- two"
+    assert payload["blocks"][0]["type"] == "header"
+    assert payload["blocks"][1]["type"] == "rich_text"
+
+
+def test_standalone_send_retries_plain_text_when_slack_rejects_blocks(
+    monkeypatch, _standalone_send
+):
+    class _BlockRejectingSession(_SlackSession):
+        def post(self, url, *, headers, json, **kwargs):
+            token = headers["Authorization"].removeprefix("Bearer ")
+            self.calls.append((token, json))
+            if "blocks" in json:
+                payload = {"ok": False, "error": "invalid_blocks"}
+            else:
+                payload = {"ok": True, "ts": "171.456"}
+            return _SlackPostContext(_SlackResponse(payload))
+
+    fake_session = _BlockRejectingSession()
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda *args, **kwargs: fake_session
+    )
+
+    pconfig = SimpleNamespace(
+        enabled=True,
+        token="good-token",
+        extra={"rich_blocks": True},
+    )
+    result = asyncio.run(_standalone_send(pconfig, "C123", "# Update"))
+
+    assert result["message_id"] == "171.456"
+    assert len(fake_session.calls) == 2
+    assert "blocks" in fake_session.calls[0][1]
+    assert "blocks" not in fake_session.calls[1][1]
