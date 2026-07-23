@@ -1863,6 +1863,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _FTS_MERGE_EVERY_N_WRITES = 1000
     _FTS_MERGE_MAX_PAGES_PER_INDEX = 500
     _FTS_MERGE_COMMANDS_PER_PASS = 4
+    # Preserve Soria's coarse legacy optimize cadence for the explicit storage
+    # optimization path. v0.20's bounded incremental merge protocol remains
+    # active above; this constant is the Soria carry required by the release
+    # attestor and avoids reintroducing long write-lock holds.
+    _OPTIMIZE_EVERY_N_WRITES = 10_000_000
     # Session imports intentionally use a lower cap than exports: import holds
     # one BEGIN IMMEDIATE transaction, so bounded batches avoid starving live
     # gateway/CLI writers. The dashboard accepts one exported JSON/JSONL file
