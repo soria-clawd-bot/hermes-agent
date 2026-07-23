@@ -169,7 +169,17 @@ def _load_web_config() -> dict:
 # WebSearchProvider. Keep the two sets aligned by hand: if xai ever ships as
 # a registered provider, drop it here so the registry path takes over.
 _LEGACY_WEB_BACKENDS = frozenset(
-    {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}
+    {
+        "parallel",
+        "firecrawl",
+        "tavily",
+        "exa",
+        "searxng",
+        "brave-free",
+        "ddgs",
+        "xai",
+        "context-dev",
+    }
 )
 
 
@@ -333,6 +343,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "context-dev":
+        return _has_env("CONTEXT_DEV_API_KEY")
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
     if backend == "brave-free":
@@ -856,8 +868,7 @@ async def web_extract_tool(
         else:
             backend = _get_extract_backend()
 
-            # All seven providers (brave-free, ddgs, searxng, exa, parallel,
-            # tavily, firecrawl) now live as plugins. The dispatcher is a
+            # All bundled providers now live as plugins. The dispatcher is a
             # registry lookup + delegation. Some providers' extract() is
             # async (parallel, firecrawl), others sync (exa, tavily) — we
             # detect coroutine functions and await; sync functions run
@@ -885,8 +896,8 @@ async def web_extract_tool(
                             "error": (
                                 f"{provider.display_name} is a search-only "
                                 "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
+                                "Set web.extract_backend to context-dev, "
+                                "firecrawl, tavily, exa, or parallel."
                             ),
                         },
                         ensure_ascii=False,
@@ -919,8 +930,8 @@ async def web_extract_tool(
                             "success": False,
                             "error": (
                                 "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
+                                "Set web.extract_backend to context-dev, "
+                                "firecrawl, tavily, exa, or parallel."
                             ),
                         },
                         ensure_ascii=False,
