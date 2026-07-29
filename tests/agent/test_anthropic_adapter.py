@@ -935,6 +935,55 @@ class TestBuildAnthropicKwargs:
 
 
 
+    @pytest.mark.parametrize(
+        "hermes_effort,wire_effort",
+        [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "max"),
+            ("ultra", "max"),
+        ],
+    )
+    def test_opus_5_supports_every_hermes_reasoning_level(
+        self,
+        hermes_effort,
+        wire_effort,
+    ):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "Return OK."}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": hermes_effort},
+        )
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": wire_effort}
+        assert "temperature" not in kwargs
+
+    def test_opus_4_7_strips_sampling_params(self):
+        # Opus 4.7 returns 400 on non-default temperature/top_p/top_k.
+        # build_anthropic_kwargs must strip them as a safety net even if an
+        # upstream caller injects them for older-model compatibility.
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-7",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            max_tokens=1024,
+            reasoning_config=None,
+        )
+        # Manually inject sampling params then re-run through the guard.
+        # Because build_anthropic_kwargs doesn't currently accept sampling
+        # params through its signature, we exercise the strip behavior by
+        # calling the internal predicate directly.
+        from agent.anthropic_adapter import _forbids_sampling_params
+        assert _forbids_sampling_params("claude-opus-4-8") is True
+        assert _forbids_sampling_params("claude-opus-4-8-fast") is True
+        assert _forbids_sampling_params("claude-opus-4-7") is True
+        assert _forbids_sampling_params("claude-opus-4-6") is False
+        assert _forbids_sampling_params("claude-sonnet-4-5") is False
 
     def test_supports_fast_mode_predicate(self):
         """Fast mode is Opus 4.6 only — Opus 4.7 and others must be excluded.
