@@ -372,6 +372,9 @@ class TestDefaultContextLengths:
             assert get_model_context_length("kimi-k2.6") == 262144
             assert get_model_context_length("kimi-k2") == 262144
 
+    def test_claude_opus_5_context_1m(self):
+        assert DEFAULT_CONTEXT_LENGTHS["claude-opus-5"] == 1_000_000
+
     def test_openrouter_live_metadata_beats_hardcoded_catchall(self):
         """OpenRouter-routed slugs resolve via the live OR catalog before the
         hardcoded family catch-all.

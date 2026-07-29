@@ -72,6 +72,7 @@ import pytest
     # Anthropic Claude 4.x thinking variants.
     ("anthropic/claude-opus-4-6", 240.0),
     ("anthropic/claude-opus-4-20250514", 240.0),
+    ("anthropic/claude-opus-5", 240.0),
     ("anthropic/claude-sonnet-4.5", 180.0),
     ("anthropic/claude-sonnet-4.6", 180.0),
     # xAI Grok reasoning variants — explicit, not bare `grok`.
