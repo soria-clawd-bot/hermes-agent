@@ -210,7 +210,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
@@ -1152,6 +1152,32 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
 
+CREATE TABLE IF NOT EXISTS session_model_usage_daily (
+    usage_date TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    billing_provider TEXT NOT NULL DEFAULT '',
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    billing_mode TEXT NOT NULL DEFAULT '',
+    task TEXT NOT NULL DEFAULT '',
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    actual_cost_usd REAL NOT NULL DEFAULT 0,
+    cost_status TEXT,
+    cost_source TEXT,
+    first_seen REAL,
+    last_seen REAL,
+    PRIMARY KEY (
+        usage_date, session_id, model, billing_provider,
+        billing_base_url, billing_mode, task
+    )
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -1201,6 +1227,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_session_model_usage_daily_date
+    ON session_model_usage_daily(usage_date);
+CREATE INDEX IF NOT EXISTS idx_session_model_usage_daily_session
+    ON session_model_usage_daily(session_id);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """
@@ -2929,6 +2959,15 @@ class SessionDB:
 
         cursor.executescript(SCHEMA_SQL)
 
+        # The daily usage table is intentionally forward-only: historical
+        # session aggregates cannot be split back into their real call dates.
+        # Stamp the instant this database first gained the ledger so reporting
+        # can distinguish genuinely covered dates from unavailable history.
+        cursor.execute(
+            "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
+            ("session_model_usage_daily_started_at", str(time.time())),
+        )
+
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
         # This is idempotent and self-healing: even if a version-gated
@@ -4588,7 +4627,7 @@ class SessionDB:
         api_call_count: int,
         task: str = "",
     ) -> None:
-        """Accumulate a per-API-call usage delta into session_model_usage.
+        """Accumulate a per-API-call usage delta into the usage ledgers.
 
         Runs inside the caller's write transaction (after the ``sessions``
         UPDATE) so the per-model rows stay consistent with the summary row.
@@ -4626,6 +4665,7 @@ class SessionDB:
             eff_base_url = billing_base_url or sess_base_url or ""
             eff_billing_mode = billing_mode or sess_billing_mode or ""
         now = time.time()
+        usage_date = time.strftime("%Y-%m-%d", time.gmtime(now))
         conn.execute(
             """INSERT INTO session_model_usage (
                    session_id, model, billing_provider, billing_base_url, billing_mode,
@@ -4648,6 +4688,51 @@ class SessionDB:
                    cost_source = COALESCE(excluded.cost_source, cost_source),
                    last_seen = excluded.last_seen""",
             (
+                session_id,
+                eff_model,
+                eff_provider,
+                eff_base_url,
+                eff_billing_mode,
+                task or "",
+                api_call_count or 0,
+                input_tokens or 0,
+                output_tokens or 0,
+                cache_read_tokens or 0,
+                cache_write_tokens or 0,
+                reasoning_tokens or 0,
+                float(estimated_cost_usd or 0.0),
+                float(actual_cost_usd or 0.0),
+                cost_status,
+                cost_source,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO session_model_usage_daily (
+                   usage_date, session_id, model, billing_provider,
+                   billing_base_url, billing_mode, task, api_call_count,
+                   input_tokens, output_tokens, cache_read_tokens,
+                   cache_write_tokens, reasoning_tokens, estimated_cost_usd,
+                   actual_cost_usd, cost_status, cost_source, first_seen, last_seen
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(
+                   usage_date, session_id, model, billing_provider,
+                   billing_base_url, billing_mode, task
+               ) DO UPDATE SET
+                   api_call_count = api_call_count + excluded.api_call_count,
+                   input_tokens = input_tokens + excluded.input_tokens,
+                   output_tokens = output_tokens + excluded.output_tokens,
+                   cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                   cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                   estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                   actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
+                   cost_status = COALESCE(excluded.cost_status, cost_status),
+                   cost_source = COALESCE(excluded.cost_source, cost_source),
+                   last_seen = excluded.last_seen""",
+            (
+                usage_date,
                 session_id,
                 eff_model,
                 eff_provider,

@@ -575,6 +575,40 @@ class TestSessionLifecycle:
         assert row["input_tokens"] == 300
         assert row["output_tokens"] == 150
 
+        daily = db._conn.execute(
+            "SELECT api_call_count, input_tokens, output_tokens "
+            "FROM session_model_usage_daily WHERE session_id = 's1'"
+        ).fetchall()
+        assert len(daily) == 1
+        assert daily[0]["api_call_count"] == 2
+        assert daily[0]["input_tokens"] == 300
+        assert daily[0]["output_tokens"] == 150
+
+    def test_daily_usage_splits_at_utc_midnight(self, db, monkeypatch):
+        """Calls on opposite sides of UTC midnight land on distinct dates."""
+        db.create_session(session_id="midnight", source="cli")
+        current_time = [1_754_524_799.0]
+        monkeypatch.setattr("hermes_state.time.time", lambda: current_time[0])
+
+        db.update_token_counts(
+            "midnight", input_tokens=10, model="gpt-test",
+            billing_provider="openai-codex", api_call_count=1,
+        )
+        current_time[0] = 1_754_524_800.0
+        db.update_token_counts(
+            "midnight", input_tokens=20, model="gpt-test",
+            billing_provider="openai-codex", api_call_count=1,
+        )
+
+        rows = db._conn.execute(
+            "SELECT usage_date, input_tokens FROM session_model_usage_daily "
+            "WHERE session_id = 'midnight' ORDER BY usage_date"
+        ).fetchall()
+        assert [(r["usage_date"], r["input_tokens"]) for r in rows] == [
+            ("2025-08-06", 10),
+            ("2025-08-07", 20),
+        ]
+
     def test_mid_session_switch_splits_per_model_usage(self, db):
         """The headline #51607 case: tokens after a /model switch are
         attributed to the new model, not the session's initial model.
@@ -610,6 +644,20 @@ class TestSessionLifecycle:
         assert rows["anthropic/claude-opus-4.8"]["billing_provider"] == "openrouter"
         assert rows["anthropic/claude-opus-4.8"]["api_call_count"] == 3
 
+        daily_rows = {
+            r["model"]: r
+            for r in db._conn.execute(
+                "SELECT model, billing_provider, input_tokens, api_call_count "
+                "FROM session_model_usage_daily WHERE session_id = 's1'"
+            ).fetchall()
+        }
+        assert set(daily_rows) == {
+            "deepseek/deepseek-v4-pro", "anthropic/claude-opus-4.8",
+        }
+        assert daily_rows["deepseek/deepseek-v4-pro"]["input_tokens"] == 40_000
+        assert daily_rows["anthropic/claude-opus-4.8"]["billing_provider"] == "openrouter"
+        assert daily_rows["anthropic/claude-opus-4.8"]["api_call_count"] == 3
+
         # Summary row: latest model + combined totals (unchanged behaviour).
         session = db.get_session("s1")
         assert session["model"] == "anthropic/claude-opus-4.8"
@@ -644,6 +692,11 @@ class TestSessionLifecycle:
             "SELECT COUNT(*) AS n FROM session_model_usage WHERE session_id = 's1'"
         ).fetchone()
         assert rows["n"] == 0
+        daily_rows = db._conn.execute(
+            "SELECT COUNT(*) AS n FROM session_model_usage_daily "
+            "WHERE session_id = 's1'"
+        ).fetchone()
+        assert daily_rows["n"] == 0
 
     def test_per_model_usage_keeps_distinct_billing_routes(self, db):
         """The same model through distinct billing routes must not collapse."""
@@ -670,6 +723,70 @@ class TestSessionLifecycle:
             ("https://one.example/v1", "api_key", 10),
             ("https://two.example/v1", "subscription_included", 20),
         ]
+
+        daily_rows = db._conn.execute(
+            "SELECT billing_base_url, billing_mode, input_tokens "
+            "FROM session_model_usage_daily WHERE session_id = 'routes' "
+            "ORDER BY billing_base_url"
+        ).fetchall()
+        assert [(r["billing_base_url"], r["billing_mode"], r["input_tokens"])
+                for r in daily_rows] == [
+            ("https://one.example/v1", "api_key", 10),
+            ("https://two.example/v1", "subscription_included", 20),
+        ]
+
+    def test_auxiliary_usage_is_recorded_in_daily_ledger(self, db):
+        db.create_session(session_id="aux", source="cli", model="main-model")
+        db.record_auxiliary_usage(
+            "aux", "title_generation", model="aux-model",
+            billing_provider="openai-api", input_tokens=30,
+            output_tokens=7, estimated_cost_usd=0.02,
+        )
+
+        row = db._conn.execute(
+            "SELECT task, model, billing_provider, api_call_count, input_tokens, "
+            "output_tokens, estimated_cost_usd FROM session_model_usage_daily "
+            "WHERE session_id = 'aux'"
+        ).fetchone()
+        assert dict(row) == {
+            "task": "title_generation",
+            "model": "aux-model",
+            "billing_provider": "openai-api",
+            "api_call_count": 1,
+            "input_tokens": 30,
+            "output_tokens": 7,
+            "estimated_cost_usd": 0.02,
+        }
+
+    def test_daily_ledger_activation_marker_is_stable(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "activation.db"
+        monkeypatch.setattr("hermes_state.time.time", lambda: 1000.25)
+        first = SessionDB(db_path=db_path)
+        try:
+            assert first.get_meta("session_model_usage_daily_started_at") == "1000.25"
+        finally:
+            first.close()
+
+        monkeypatch.setattr("hermes_state.time.time", lambda: 2000.5)
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.get_meta("session_model_usage_daily_started_at") == "1000.25"
+        finally:
+            reopened.close()
+
+    def test_daily_usage_cascades_with_session_delete(self, db):
+        db.create_session(session_id="delete-me", source="cli")
+        db.update_token_counts(
+            "delete-me", input_tokens=1, model="gpt-test",
+            billing_provider="openai-codex", api_call_count=1,
+        )
+        db._conn.execute("DELETE FROM sessions WHERE id = 'delete-me'")
+        db._conn.commit()
+        count = db._conn.execute(
+            "SELECT COUNT(*) FROM session_model_usage_daily "
+            "WHERE session_id = 'delete-me'"
+        ).fetchone()[0]
+        assert count == 0
 
     def test_metadata_only_update_does_not_replace_requested_route(self, db):
         db.create_session(session_id="metadata", source="cli", model="primary")
@@ -7234,4 +7351,3 @@ class TestDisplayMetadataPersistence:
         switched = [m for m in reloaded if m.get("display_kind") == "model_switch"]
         assert len(switched) == 1
         assert switched[0]["display_metadata"] == meta
-
