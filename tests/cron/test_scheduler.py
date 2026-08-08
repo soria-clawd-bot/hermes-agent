@@ -1104,9 +1104,9 @@ class TestRunJobWakeGate:
         import cron.scheduler as scheduler
 
         call_count = 0
-        def _script_stub(path, *, cwd=None):
+        def _script_stub(path, *, workdir=None):
             nonlocal call_count
-            assert cwd is None
+            assert workdir is None
             call_count += 1
             return (True, "regular output")
 
@@ -1957,4 +1957,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
