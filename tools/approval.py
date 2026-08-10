@@ -602,7 +602,7 @@ HARDLINE_PATTERNS = [
     (
         _CMDPOS
         + r'kill\s+(?![^\n]*\s--\s)(?:-[^\s]+\s+)*-'
-        + r'(?:["\']?\$(?:\{?[a-z_][a-z0-9_]*\}?|[0-9]+)["\']?|\d+)'
+        + r'(?:["\']?\$(?:\{?[a-z_][a-z0-9_]*\}?|[0-9]+)["\']?|\d+(?!\s+\d+\b))'
         + r'(?=[\s;&|]|$)',
         "ambiguous negative process target (use -- -PGID)",
     ),

@@ -42,7 +42,9 @@ class TestSessionOwnsNotificationEvent:
 
     def test_session_key_match_owns(self):
         evt = {"type": "async_delegation", "origin_ui_session_id": "", "session_key": "sess_key_1"}
-        assert _session_owns_notification_event("tabX", self._session("sess_key_1"), evt) is True
+        session = self._session("sess_key_1")
+        with patch.dict("tui_gateway.server._sessions", {"tabX": session}, clear=True):
+            assert _session_owns_notification_event("tabX", session, evt) is True
 
     def test_orphan_is_not_owned(self):
         """No origin match, no key match, owner gone → NOT ours (fail closed)."""
@@ -64,8 +66,12 @@ class TestSessionOwnsNotificationEvent:
         evt = {"type": "async_delegation", "origin_ui_session_id": "", "session_key": "parent_key"}
         db = MagicMock()
         db.resolve_resume_session_id.return_value = "child_key"
-        with patch("tui_gateway.server._get_db", return_value=db):
-            assert _session_owns_notification_event("tabX", self._session("child_key"), evt) is True
+        session = self._session("child_key")
+        with (
+            patch("tui_gateway.server._get_db", return_value=db),
+            patch.dict("tui_gateway.server._sessions", {"tabX": session}, clear=True),
+        ):
+            assert _session_owns_notification_event("tabX", session, evt) is True
 
 
 class TestInterruptForSession:
