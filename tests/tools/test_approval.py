@@ -681,6 +681,7 @@ class TestHostSessionTerminationHardline:
             "loginctl terminate-user openclaw",
             "kill -TERM -$pid",
             'kill -TERM -"$pid"',
+            "kill -9 -1330",
             "sudo kill -TERM -1330",
         ),
     )
@@ -695,6 +696,7 @@ class TestHostSessionTerminationHardline:
             "systemctl --user status",
             "loginctl show-user openclaw",
             "kill -TERM 1330",
+            "kill -9 12345",
             "kill -TERM -- -1330",
         ),
     )
