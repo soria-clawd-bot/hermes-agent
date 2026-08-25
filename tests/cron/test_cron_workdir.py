@@ -316,3 +316,35 @@ class TestRunJobTerminalCwd:
         assert observed["terminal_cwd_during_run"] == baseline
         assert os.environ["TERMINAL_CWD"] == baseline
         assert get_session_cwd(observed["task_id"]) is None
+
+    def test_no_agent_workdir_is_subprocess_cwd_without_process_chdir(
+        self, tmp_path, monkeypatch
+    ):
+        """Pure-script jobs must not mutate the scheduler process cwd."""
+        import os
+        import cron.scheduler as sched
+
+        hermes_home = tmp_path / "hermes-home"
+        scripts_dir = hermes_home / "scripts"
+        scripts_dir.mkdir(parents=True)
+        workdir = tmp_path / "project"
+        workdir.mkdir()
+        (scripts_dir / "show_cwd.py").write_text(
+            "from pathlib import Path\nprint(Path.cwd())\n"
+        )
+        monkeypatch.setattr(sched, "_get_hermes_home", lambda: hermes_home)
+
+        process_cwd = os.getcwd()
+        success, _doc, response, error = sched.run_job(
+            {
+                "id": "script-workdir",
+                "name": "script-workdir",
+                "no_agent": True,
+                "script": "show_cwd.py",
+                "workdir": str(workdir),
+            }
+        )
+
+        assert success is True, error
+        assert response == str(workdir.resolve())
+        assert os.getcwd() == process_cwd
