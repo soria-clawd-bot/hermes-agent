@@ -28,6 +28,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    HOST_RUNTIME_SAFETY_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
@@ -282,6 +283,24 @@ class TestBuildSkillsSystemPrompt:
         clear_skills_system_prompt_cache(clear_snapshot=True)
 
 
+
+    def test_skill_loading_guidance_is_targeted(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "clearly applies and materially improves execution" in result
+        assert "smallest non-overlapping set" in result
+        assert "core instructions are already in context" in result
+        assert "partial or incidental relevance" in result
+        assert "even partially relevant" not in result
+        assert "Err on the side of loading" not in result
+        assert "Only proceed without loading a skill" not in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1032,6 +1051,15 @@ class TestExecutionGuidanceModels:
             assert fam not in EXECUTION_GUIDANCE_MODELS
 
 
+class TestHostRuntimeSafetyGuidance:
+    def test_guidance_is_short_and_specific(self):
+        text = HOST_RUNTIME_SAFETY_GUIDANCE.lower()
+        assert "shared host" in text
+        assert "user-session-wide" in text
+        assert "exact pid" in text
+        assert len(HOST_RUNTIME_SAFETY_GUIDANCE) < 600
+
+
 class TestParallelToolCallGuidance:
     """Behavior contracts for the universal parallel-tool-call guidance block.
 
@@ -1056,5 +1084,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

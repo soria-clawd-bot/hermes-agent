@@ -423,6 +423,17 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Universal shared-host safety guidance. Kept short because it is included in
+# every tool-using agent's cached system prompt, including delegated and
+# workflow children that intentionally skip cwd context files.
+HOST_RUNTIME_SAFETY_GUIDANCE = (
+    "# Host runtime safety\n"
+    "Treat existing processes and services on a shared host as owned state. "
+    "Do not stop, restart, or kill them unless the task explicitly requires it. "
+    "Never use broad or user-session-wide termination. Identify the exact PID, "
+    "process group, or service unit first, and ask when the scope is unclear."
+)
+
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
 # Why this matters for cost: every assistant turn resends the entire
@@ -2167,17 +2178,13 @@ def _build_skills_system_prompt_inner(
                     index_lines.append(f"    - {name}")
 
         result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
+            "## Skills\n"
+            "Before replying, scan the skills below. Load a skill when it clearly applies and "
+            "materially improves execution. Use the smallest non-overlapping set needed for the "
+            "current step. If a skill's core instructions are already in context, do not reload it "
+            "by default; reload only when its exact details or linked references would help. "
+            "Prefer specific skills over generic ones, defer later-phase skills until needed, and "
+            "do not load skills based only on partial or incidental relevance.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
@@ -2190,9 +2197,7 @@ def _build_skills_system_prompt_inner(
             "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "</available_skills>"
             + hidden_note
         )
 

@@ -22,8 +22,11 @@ import pytest
 from plugins.platforms.slack.adapter import _standalone_send
 
 
-def _pconfig(token: str = "xoxb-test"):
-    return SimpleNamespace(token=token, extra={})
+def _pconfig(token: str = "xoxb-test", *, rich_blocks: bool = False):
+    return SimpleNamespace(
+        token=token,
+        extra={"rich_blocks": True} if rich_blocks else {},
+    )
 
 
 def _tmpfile(suffix: str) -> str:
@@ -94,15 +97,18 @@ def test_text_plus_pdf_uploads_via_files_upload_v2():
         with _fake_slack_sdk(client):
             result = asyncio.run(
                 _standalone_send(
-                    _pconfig(),
+                    _pconfig(rich_blocks=True),
                     "C012AB3CD",
-                    "Here is the report",
+                    "# Report\n\nHere is the report",
                     media_files=[(pdf, False)],
                 )
             )
         assert result["success"] is True
         assert result["platform"] == "slack"
         client.chat_postMessage.assert_awaited_once()
+        post_kwargs = client.chat_postMessage.await_args.kwargs
+        assert post_kwargs["text"] == "*Report*\n\nHere is the report"
+        assert post_kwargs["blocks"][0]["type"] == "header"
         client.files_upload_v2.assert_awaited_once()
         upload_kwargs = client.files_upload_v2.await_args.kwargs
         assert upload_kwargs["channel"] == "C012AB3CD"
