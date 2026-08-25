@@ -201,6 +201,36 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+    exit_match = re.search(r"\bScript exited with code\s+(\d+)\b", text)
+    exit_suffix = f" (exit {exit_match.group(1)})" if exit_match else ""
+
+    # Script failures put stderr before stdout. Diagnose those failures from
+    # stderr and work backward from its tail: startup warnings commonly appear
+    # first, while the causal exception is normally the final meaningful line.
+    # For non-script failures, retain upstream's full-text classifications and
+    # compact fallback verbatim.
+    diagnostic_text = text.split("\nstdout:\n", 1)[0]
+    candidates: list[str] = []
+    if exit_match:
+        for raw_line in diagnostic_text.splitlines()[-200:]:
+            line = " ".join(raw_line.split())
+            if not line or line in {"stderr:", "stdout:"}:
+                continue
+            if re.fullmatch(r"Script exited with code \d+", line):
+                continue
+            lower_line = line.lower()
+            if "warning" in lower_line:
+                continue
+            if line.startswith((
+                "Traceback (most recent call last):",
+                "During handling of the above exception",
+            )):
+                continue
+            if re.match(r'^File ".+", line \d+', line) or line.startswith("raise "):
+                continue
+            candidates.append(line)
+    candidate_text = "\n".join(candidates) if exit_match else text
+    candidate_lower = candidate_text.lower()
 
     if "skipped to prevent unintended spend: global inference config drifted" in lower:
         if "finite one-shot job is consumed" in lower:
@@ -258,15 +288,17 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # let identifiers containing those digits (job ids, ports, hashes) trip
     # a false "provider rate limit" alert.
     if provider_reachable and (
-        re.search(r"\b429\b", text) or "rate limit" in lower or "usage limit" in lower
+        re.search(r"\b429\b", candidate_text)
+        or "rate limit" in candidate_lower
+        or "usage limit" in candidate_lower
     ):
         reason = "rate limit"
-        if "weekly usage limit" in lower:
+        if "weekly usage limit" in candidate_lower:
             reason = "weekly usage limit"
-        elif "quota" in lower:
+        elif "quota" in candidate_lower:
             reason = "quota limit"
         return (
-            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
+            f"⚠️ Cron '{job_name}' failed{exit_suffix}: provider {reason}. "
             f"{_fallback_chain_phrase()} "
             "Full details saved in cron output."
         )
@@ -310,10 +342,12 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
         )
 
     if provider_reachable and (
-        "readtimeout" in lower or "timed out" in lower or "timeout" in lower
+        "readtimeout" in candidate_lower
+        or "timed out" in candidate_lower
+        or "timeout" in candidate_lower
     ):
         return (
-            f"⚠️ Cron '{job_name}' failed: provider timeout. "
+            f"⚠️ Cron '{job_name}' failed{exit_suffix}: provider timeout. "
             f"{_fallback_chain_phrase()} "
             "Full details saved in cron output."
         )
@@ -322,10 +356,29 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
     # not trip a misleading auth message.
     if provider_reachable and (
-        re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text)
+        re.search(r"authenticat|authoriz", candidate_lower)
+        or re.search(r"\b(401|403)\b", candidate_text)
     ):
         return (
-            f"⚠️ Cron '{job_name}' failed: provider authentication error. "
+            f"⚠️ Cron '{job_name}' failed{exit_suffix}: provider authentication error. "
+            "Full details saved in cron output."
+        )
+
+    if exit_match:
+        if not candidates:
+            return (
+                f"⚠️ Cron '{job_name}' failed{exit_suffix}: causal error unavailable. "
+                "Full details saved in cron output."
+            )
+        cleaned = re.sub(
+            r"^(?:[A-Za-z_][\w.]*?(?:Error|Exception)|Exception):\s*",
+            "",
+            candidates[-1],
+        )
+        if len(cleaned) > 180:
+            cleaned = cleaned[:177].rstrip() + "..."
+        return (
+            f"⚠️ Cron '{job_name}' failed{exit_suffix}: {cleaned}. "
             "Full details saved in cron output."
         )
 
@@ -540,6 +593,7 @@ from cron.jobs import (
     fire_claim_fence,
     clear_run_claim,
     get_due_jobs,
+    get_job,
     heartbeat_fire_claim,
     heartbeat_run_claim,
     mark_job_run,
@@ -6477,6 +6531,28 @@ def _run_one_job_body(
         return True
 
     execution_id = job.get("execution_id")
+    normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+    try:
+        previous_job = get_job(job["id"])
+    except Exception as exc:
+        logger.debug(
+            "Job '%s': could not inspect prior failure state: %s", job["id"], exc
+        )
+        previous_job = None
+    previous_failure_summary = None
+    previous_failure_was_delivered = False
+    if (
+        previous_job
+        and previous_job.get("last_status") == "error"
+        and previous_job.get("last_error")
+    ):
+        previous_failure_summary = _summarize_cron_failure_for_delivery(
+            job, previous_job["last_error"]
+        )
+        previous_failure_was_delivered = (
+            normalized_deliver != "local"
+            and not previous_job.get("last_delivery_error")
+        )
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
     delivery_attempted = False
@@ -6656,10 +6732,34 @@ def _run_one_job_body(
                     "the configuration is fixed."
                 )
             else:
-                deliver_content = final_response if success else (
-                    _summarize_cron_failure_for_delivery(job, error)
-                    + _failure_streak_nudge(job)
-                )
+                if success:
+                    if (
+                        previous_failure_summary
+                        and previous_failure_was_delivered
+                        and final_response.strip()
+                    ):
+                        recovery = (
+                            f"✅ Cron '{job.get('name') or job['id']}' recovered "
+                            "after a prior failure."
+                        )
+                        if _is_cron_silence_response(final_response):
+                            deliver_content = recovery
+                        else:
+                            deliver_content = f"{recovery}\n\n{final_response}"
+                    else:
+                        deliver_content = final_response
+                else:
+                    failure_summary = _summarize_cron_failure_for_delivery(job, error)
+                    deliver_content = failure_summary + _failure_streak_nudge(job)
+                    if (
+                        previous_failure_was_delivered
+                        and failure_summary == previous_failure_summary
+                    ):
+                        logger.info(
+                            "Job '%s': suppressing duplicate failure delivery",
+                            job["id"],
+                        )
+                        deliver_content = ""
                 if drift_skip and not success:
                     # Drift-skip alert: bypass the generic summarizer's
                     # 180-char truncation (it would eat the remediation
@@ -6798,7 +6898,6 @@ def _run_one_job_body(
                 error="Fire claim ownership lost before terminal completion.",
             )
             return True
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
         elif should_deliver and unresolved_origin:
