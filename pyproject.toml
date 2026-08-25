@@ -224,6 +224,11 @@ wake = [
   "openwakeword==0.6.0",
   "onnxruntime==1.27.0",
   "sherpa-onnx==1.13.4",
+  # The sherpa-onnx wheel declares this exact split runtime dependency, but
+  # uv does not currently materialize it from the wheel metadata during an
+  # all-extras sync. Keep the pair explicit so release environments pass a
+  # full installed-distribution dependency check.
+  "sherpa-onnx-core==1.13.4",
   "sentencepiece==0.2.2",
   "pvporcupine==4.0.3",
   "sounddevice==0.5.5",
