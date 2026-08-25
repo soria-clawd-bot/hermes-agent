@@ -4315,14 +4315,23 @@ def tick(
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-        # Partition due jobs: those with a per-job workdir mutate
+        # Partition due jobs: agent jobs with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
+        # they queue on the single-thread sequential pool.  no_agent jobs pass
+        # workdir directly to their subprocess and are safe to parallelize.
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        sequential_jobs = [
+            j
+            for j in due_jobs
+            if (j.get("workdir") or "").strip() and not j.get("no_agent")
+        ]
+        parallel_jobs = [
+            j
+            for j in due_jobs
+            if not ((j.get("workdir") or "").strip() and not j.get("no_agent"))
+        ]
 
         _results: list = []
         _all_futures: list = []
