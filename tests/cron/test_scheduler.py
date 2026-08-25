@@ -1711,9 +1711,10 @@ class TestRunJobWakeGate:
         import cron.scheduler as scheduler
 
         call_count = 0
-        def _script_stub(path, *, cwd=None):
+        def _script_stub(path, *, workdir=None, cancel_event=None):
             nonlocal call_count
-            assert cwd is None
+            assert workdir is None
+            assert cancel_event is None
             call_count += 1
             return (True, "regular output")
 
