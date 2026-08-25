@@ -15,6 +15,18 @@ import pytest
 import cron.scheduler as s
 
 
+_STALE_RESEARCH_FAILURE = "\n".join(
+    (
+        "Script exited with code 1",
+        "stderr:",
+        "/venv/requests/__init__.py:113: RequestsDependencyWarning: urllib3 is unsupported",
+        "  warnings.warn(message, RequestsDependencyWarning)",
+        "Traceback (most recent call last):",
+        "ValueError: Research note version is stale",
+    )
+)
+
+
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
                     error=None, silent_marker_in=None):
     """Patch the job pipeline primitives and record the call order."""
@@ -76,6 +88,59 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
+
+
+def test_failure_summary_uses_causal_tail_instead_of_a_startup_warning():
+    summary = s._summarize_cron_failure_for_delivery(
+        {"id": "j-warning", "name": "signal-wire"}, _STALE_RESEARCH_FAILURE
+    )
+
+    assert "exit 1" in summary
+    assert "Research note version is stale" in summary
+    assert "RequestsDependencyWarning" not in summary
+
+
+def test_run_one_job_suppresses_a_duplicate_delivered_failure(monkeypatch):
+    from cron.jobs import create_job, mark_job_run
+
+    job = create_job(
+        prompt="Check the Signal wire.",
+        schedule="every 1h",
+        name="signal-wire",
+        deliver="slack:channel",
+    )
+    mark_job_run(job["id"], success=False, error=_STALE_RESEARCH_FAILURE)
+    calls = _patch_pipeline(monkeypatch, success=False, error=_STALE_RESEARCH_FAILURE)
+
+    assert s.run_one_job(job) is True
+
+    assert [call[0] for call in calls] == ["run_job", "save", "mark"]
+
+
+def test_run_one_job_delivers_a_recovery_after_a_silent_success(monkeypatch):
+    from cron.jobs import create_job, mark_job_run
+
+    job = create_job(
+        prompt="Check the Signal wire.",
+        schedule="every 1h",
+        name="signal-wire",
+        deliver="slack:channel",
+    )
+    mark_job_run(job["id"], success=False, error=_STALE_RESEARCH_FAILURE)
+    calls = _patch_pipeline(monkeypatch, silent_marker_in=s.SILENT_MARKER)
+    delivered: list[str] = []
+
+    def capture_delivery(_job, content, adapters=None, loop=None):
+        delivered.append(content)
+        calls.append(("deliver", _job["id"]))
+        return None
+
+    monkeypatch.setattr(s, "_deliver_result", capture_delivery)
+
+    assert s.run_one_job(job) is True
+
+    assert delivered == ["✅ Cron 'signal-wire' recovered after a prior failure."]
+    assert [call[0] for call in calls] == ["run_job", "save", "deliver", "mark"]
 
 
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
@@ -376,5 +441,4 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_delivery["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after the full lifecycle returned (no leak).
     assert ss.current_secret_scope() is None
-
 
