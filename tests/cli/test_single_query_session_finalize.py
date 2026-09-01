@@ -3,12 +3,16 @@ from types import SimpleNamespace
 import pytest
 
 import cli
+from gateway.session_context import async_delivery_supported, reset_session_vars
 
 
 @pytest.fixture(autouse=True)
 def reset_single_query_finalize_state(monkeypatch):
+    reset_session_vars()
     monkeypatch.setattr(cli, "_single_query_finalize_attempted_session_ids", set())
     monkeypatch.setattr(cli, "_cleanup_done", False)
+    yield
+    reset_session_vars()
 
 
 
@@ -107,6 +111,7 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
             calls.append("advisories")
 
         def chat(self, query, images=None):
+            calls.append(("async-delivery", async_delivery_supported()))
             calls.append(("chat", query, images))
             return "done"
 
@@ -127,6 +132,7 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
         ("claim", "cli", False),
         "query-label",
         "advisories",
+        ("async-delivery", False),
         ("chat", "hello", None),
         "summary",
         ("finalize", "single-query-session"),
