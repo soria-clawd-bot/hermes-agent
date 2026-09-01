@@ -166,6 +166,35 @@ def test_no_deadline_still_runs_on_worker(monkeypatch, fake_agent):
     assert seen_thread and seen_thread[0] != threading.current_thread().ident
 
 
+def test_delegate_task_uses_its_own_child_lifecycle(monkeypatch, fake_agent):
+    """The generic tool deadline must not preempt a healthy delegated child."""
+
+    def _fake_middleware(agent_arg, **kwargs):
+        time.sleep(0.1)
+        return _ManagedToolResult(
+            result="child result", args={}, middleware_trace=[],
+            blocked=False, dispatched=True,
+        )
+
+    monkeypatch.setattr(
+        tool_executor, "_run_agent_tool_execution_middleware", _fake_middleware
+    )
+    monkeypatch.setattr(
+        tool_executor, "_resolve_sequential_tool_timeout", lambda: 0.01
+    )
+
+    managed = _run_sequential_tool_execution_middleware(
+        fake_agent,
+        function_name="delegate_task",
+        function_args={"goal": "review"},
+        effective_task_id="t",
+        tool_call_id="call_delegate",
+        execute=lambda a: "unused",
+    )
+
+    assert managed.result == "child result"
+
+
 def test_never_parallel_tools_stay_inline(monkeypatch, fake_agent):
     """clarify (interactive) keeps the inline path — it owns its own wait."""
 

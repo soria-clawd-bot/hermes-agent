@@ -815,7 +815,17 @@ def _run_sequential_tool_execution_middleware(
     ``<= 0``) owns that wait. Applying the generic tool deadline here would
     return ``tool_timeout`` while the prompt and worker stay active.
     """
-    timeout_s = _resolve_sequential_tool_timeout()
+    # ``delegate_task`` owns its child lifecycle: it has progress heartbeats,
+    # stall detection, and an optional delegation.child_timeout_seconds hard
+    # bound.  Do not let the generic per-tool deadline preempt a healthy child
+    # that is still working (slow reasoning models can legitimately run past
+    # the stock 420-second tool limit).  Keep the worker/poll loop below so a
+    # user interrupt can still abandon the wait promptly.
+    timeout_s = (
+        None
+        if function_name == "delegate_task"
+        else _resolve_sequential_tool_timeout()
+    )
     kwargs = {
         "function_name": function_name,
         "function_args": function_args,
