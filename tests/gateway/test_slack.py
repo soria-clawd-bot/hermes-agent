@@ -212,6 +212,77 @@ def _redirect_cache(tmp_path, monkeypatch):
     )
 
 
+class _DenyingGateway:
+    def _is_user_authorized(self, _source):
+        return False
+
+    async def handle(self, _event):
+        return None
+
+
+class TestPreAuthDispatchUsers:
+    """A named user may reach hooks without becoming gateway-authorized."""
+
+    @staticmethod
+    def _thread_event(user_id: str) -> dict:
+        return {
+            "type": "message",
+            "user": user_id,
+            "channel": "C_RESEARCH",
+            "channel_type": "channel",
+            "ts": "1788390000.123456",
+            "thread_ts": "1788380000.000001",
+            "client_msg_id": "client-message-1",
+            "text": "<@U_BOT> Research feedback",
+        }
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_user_is_still_rejected_before_dispatch(self, adapter):
+        runner = _DenyingGateway()
+        adapter.set_message_handler(runner.handle)
+
+        await adapter._handle_slack_message(self._thread_event("U_REVIEWER"))
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_named_user_reaches_gateway_pre_auth_dispatch(self, adapter):
+        runner = _DenyingGateway()
+        adapter.set_message_handler(runner.handle)
+        adapter.config.extra["pre_auth_dispatch_thread_users"] = ["U_REVIEWER"]
+
+        await adapter._handle_slack_message(self._thread_event("U_REVIEWER"))
+
+        adapter.handle_message.assert_awaited_once()
+        delivered = adapter.handle_message.await_args.args[0]
+        assert delivered.source.user_id == "U_REVIEWER"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "event_changes",
+        [
+            {"channel": "D_RESEARCH", "channel_type": "im"},
+            {"thread_ts": "1788390000.123456"},
+        ],
+    )
+    async def test_named_user_cannot_bypass_early_auth_outside_channel_replies(
+        self, adapter, event_changes
+    ):
+        runner = _DenyingGateway()
+        adapter.set_message_handler(runner.handle)
+        adapter.config.extra["pre_auth_dispatch_thread_users"] = ["U_REVIEWER"]
+        event = {**self._thread_event("U_REVIEWER"), **event_changes}
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
+
+    def test_wildcard_cannot_disable_the_early_auth_guard(self, adapter):
+        adapter.config.extra["pre_auth_dispatch_thread_users"] = ["*"]
+
+        assert adapter._slack_pre_auth_dispatch_thread_users() == set()
+
+
 class TestBotEventDiagnostics:
     """#30091 — surface upstream filters that drop bot events."""
 
