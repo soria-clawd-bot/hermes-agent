@@ -2501,6 +2501,26 @@ class SlackAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _slack_pre_auth_dispatch_thread_users(self) -> set[str]:
+        """Users whose channel-thread replies may reach the pre-auth hook.
+
+        This is deliberately not an authorization allowlist. It only bypasses
+        Slack's adapter-side early reject so ``pre_gateway_dispatch`` plugins
+        can inspect a normalized event. If no plugin consumes the event, the
+        gateway's ordinary authorization check still rejects the user.
+
+        Wildcards are ignored: this exception must always name exact users.
+        """
+        raw = self.config.extra.get("pre_auth_dispatch_thread_users")
+        if raw is None:
+            raw = os.getenv("SLACK_PRE_AUTH_DISPATCH_THREAD_USERS", "")
+        values = raw if isinstance(raw, (list, tuple, set)) else str(raw or "").split(",")
+        return {
+            str(value).strip()
+            for value in values
+            if str(value).strip() and str(value).strip() != "*"
+        }
+
     def _is_ignored_channel(self, channel_id: str) -> bool:
         """Return True when generic Slack gateway must stay silent here.
 
@@ -6056,13 +6076,27 @@ class SlackAdapter(BasePlatformAdapter):
                 user_id=user_id,
                 user_name="",
             )
-            if not _auth_fn(_source):
+            _authorized = _auth_fn(_source)
+            _pre_auth_thread_reply = (
+                not is_dm
+                and bool(event.get("thread_ts"))
+                and event.get("thread_ts") != ts
+                and user_id in self._slack_pre_auth_dispatch_thread_users()
+            )
+            if not _authorized and not _pre_auth_thread_reply:
                 logger.warning(
                     "[Slack] Early reject of unauthorized user %s in channel %s",
                     user_id,
                     channel_id,
                 )
                 return
+            if not _authorized:
+                logger.info(
+                    "[Slack] Passing pre-auth channel-thread user %s in channel %s to gateway hooks; "
+                    "normal gateway authorization remains enforced",
+                    user_id,
+                    channel_id,
+                )
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
