@@ -274,21 +274,15 @@ class TestSyncMode:
         sched._shutdown_parallel_pool()
 
 
-class TestSequentialPool:
-    """Sequential (workdir) jobs use the persistent cron-seq pool.
+class TestWorkdirParallelPool:
+    """Task-scoped workdir jobs use the normal persistent parallel pool."""
 
-    Verifies the follow-up fix: env-mutating jobs no longer run inline
-    in the ticker thread, so a long workdir job can't starve the
-    schedule the same way the parallel path used to.
-    """
-
-    def test_sequential_job_does_not_block_ticker(self, tmp_path, monkeypatch):
+    def test_workdir_job_does_not_block_ticker(self, tmp_path, monkeypatch):
         """sync=False returns immediately even when a workdir job is slow."""
         import cron.scheduler as sched
 
         sched._parallel_pool = None
         sched._parallel_pool_max_workers = None
-        sched._sequential_pool = None
         sched._running_job_ids.clear()
 
         job = {
@@ -299,7 +293,7 @@ class TestSequentialPool:
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
-            "workdir": str(tmp_path),  # makes it sequential
+            "workdir": str(tmp_path),
         }
 
         barrier = threading.Barrier(2, timeout=5)
@@ -326,13 +320,12 @@ class TestSequentialPool:
         time.sleep(0.1)
         sched._shutdown_parallel_pool()
 
-    def test_sequential_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):
+    def test_workdir_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):
         """A workdir job already in _running_job_ids is skipped on next tick."""
         import cron.scheduler as sched
 
         sched._parallel_pool = None
         sched._parallel_pool_max_workers = None
-        sched._sequential_pool = None
         sched._running_job_ids.clear()
 
         job = {
@@ -363,64 +356,6 @@ class TestSequentialPool:
 
         sched._running_job_ids.discard("guard-seq")
         sched._shutdown_parallel_pool()
-
-    def test_get_sequential_pool_is_persistent(self):
-        """_get_sequential_pool returns the same single-thread pool."""
-        import cron.scheduler as sched
-
-        sched._sequential_pool = None
-        pool1 = sched._get_sequential_pool()
-        pool2 = sched._get_sequential_pool()
-        assert pool1 is pool2
-
-        sched._shutdown_parallel_pool()
-        assert sched._sequential_pool is None
-
-    def test_no_agent_workdir_job_uses_parallel_pool(self, tmp_path, monkeypatch):
-        """A script-only cwd is subprocess-local and must not queue behind agents."""
-        import concurrent.futures
-        import cron.scheduler as sched
-
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
-        sched._running_job_ids.clear()
-
-        class ImmediatePool:
-            def __init__(self):
-                self.submissions = 0
-
-            def submit(self, fn):
-                self.submissions += 1
-                future = concurrent.futures.Future()
-                try:
-                    future.set_result(fn())
-                except Exception as exc:  # pragma: no cover - assertion aid
-                    future.set_exception(exc)
-                return future
-
-        sequential = ImmediatePool()
-        parallel = ImmediatePool()
-        job = {
-            "id": "parallel-script-workdir",
-            "name": "parallel-script-workdir",
-            "schedule": "every 5m",
-            "enabled": True,
-            "next_run_at": "2020-01-01T00:00:00",
-            "deliver": "local",
-            "no_agent": True,
-            "script": "watchdog.py",
-            "workdir": str(tmp_path),
-        }
-
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
-        monkeypatch.setattr(sched, "_get_sequential_pool", lambda: sequential)
-        monkeypatch.setattr(sched, "_get_parallel_pool", lambda _workers: parallel)
-        monkeypatch.setattr(sched, "run_one_job", lambda *_a, **_kw: True)
-
-        assert sched.tick(verbose=False, sync=True) == 1
-        assert sequential.submissions == 0
-        assert parallel.submissions == 1
-
 
 class TestTickBatchAdvance:
     """The tick's pre-dispatch advance must go through advance_next_runs
