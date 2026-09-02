@@ -1980,7 +1980,7 @@ class ProcessRegistry:
             _evt_task_id = str(
                 evt.get("owner_task_id") or evt.get("task_id") or ""
             )
-            if not is_async_delegation and _evt_task_id.startswith("sa-"):
+            if evt_type != "async_delegation" and _evt_task_id.startswith("sa-"):
                 if surface_child is None:
                     surface_child = self._surface_child_process_notifications()
                 if not surface_child:

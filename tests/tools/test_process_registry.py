@@ -1763,10 +1763,14 @@ def test_drain_notifications_normalizes_completion_type_before_consumed_check():
     assert registry.drain_notifications(owns_event=lambda _event: True) == []
 
 
-def test_process_session_fifth_positional_argument_remains_pid():
-    """Adding routing metadata must not silently break the public constructor order."""
-    session = ProcessSession("proc_positional", "echo hi", "task", "session", 4242)
+def test_origin_routing_metadata_preserves_upstream_positional_constructor_order():
+    """The Soria routing field must remain append-only on the v0.21 constructor."""
+    session = ProcessSession(
+        "proc_positional", "echo hi", "task", "owner", "session", 4242
+    )
 
+    assert session.owner_task_id == "owner"
+    assert session.session_key == "session"
     assert session.pid == 4242
     assert session.origin_ui_session_id == ""
 
